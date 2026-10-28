@@ -9,3 +9,5 @@ psycopg2
 Pillow
 python-dotenv
 numpy
+pronotepy
+requests
