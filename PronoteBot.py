@@ -22,13 +22,14 @@ log = logging.getLogger("pronotebot")
 # ---------------------------------------------------------------------------
 # Variables d'environnement Render
 # ---------------------------------------------------------------------------
-# On récupère le JSON complet généré par le QR Code
+# Le JSON complet initial généré par le QR Code
 PRONOTE_CREDS_JSON = os.environ.get("PRONOTE_CREDS_JSON")
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 
+# Fichiers de sauvegarde locale (effacés à chaque redémarrage sur le plan gratuit)
 SEEN_FILE        = Path(os.environ.get("SEEN_FILE", "seen_grades.json"))
-CREDS_FILE       = Path(os.environ.get("CREDS_FILE", "creds.json")) # Sauvegarde locale du token
+CREDS_FILE       = Path(os.environ.get("CREDS_FILE", "creds.json")) 
 CHECK_INTERVAL   = int(os.environ.get("CHECK_INTERVAL_MIN", "30"))
 
 class PronoteBot:
@@ -63,12 +64,14 @@ class PronoteBot:
         log.info("Connecté avec succès !")
         
         # 4. Pronote renouvelle le token à chaque connexion.
-        # On l'exporte et on l'écrase dans le fichier local pour la prochaine fois.
+        # On l'exporte, on le sauvegarde en local, ET on l'affiche dans les logs.
         try:
             new_creds = self.client.export_credentials()
             with open(CREDS_FILE, "w", encoding="utf-8") as f:
                 json.dump(new_creds, f)
-            log.debug("Nouveau token généré et sauvegardé localement.")
+            
+            # AFFICHE LE NOUVEAU TOKEN DANS LES LOGS (pour le copier dans Render)
+            log.warning("⚠️ NOUVEAU TOKEN GÉNÉRÉ (à copier dans Render si redémarrage) : %s", json.dumps(new_creds))
         except Exception as e:
             log.error("Impossible de sauvegarder le nouveau token : %s", e)
 
@@ -112,7 +115,7 @@ class PronoteBot:
         new_count = 0
 
         for period in self.client.periods:
-            # CORRECTION ICI : on utilise str() pour éviter le ValueError si c'est déjà du texte
+            # CORRECTION : on utilise str() pour éviter le ValueError si c'est déjà du texte
             overall = str(period.overall_average) if period.overall_average else "—"
             
             for g in period.grades:
