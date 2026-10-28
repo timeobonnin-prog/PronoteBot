@@ -2,7 +2,7 @@ import os
 import json
 import logging
 import threading
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 from pathlib import Path
 
 import pronotepy
@@ -27,8 +27,11 @@ PRONOTE_CREDS_JSON = os.environ.get("PRONOTE_CREDS_JSON")
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 
+# Variables pour le stockage persistant (Gist)
+GIST_ID            = os.environ.get("GIST_ID")
+GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN")
+
 SEEN_FILE        = Path(os.environ.get("SEEN_FILE", "seen_grades.json"))
-CREDS_FILE       = Path(os.environ.get("CREDS_FILE", "creds.json")) 
 CHECK_INTERVAL   = int(os.environ.get("CHECK_INTERVAL_MIN", "30"))
 
 class PronoteBot:
@@ -38,34 +41,55 @@ class PronoteBot:
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
         creds = None
-        if CREDS_FILE.exists():
-            try:
-                with open(CREDS_FILE, "r", encoding="utf-8") as f:
-                    creds = json.load(f)
-                log.info("Utilisation du token sauvegardé localement.")
-            except Exception:
-                pass
         
+        # 1. Lire le token depuis le Gist GitHub (Stockage persistant)
+        if GIST_ID and GITHUB_TOKEN:
+            try:
+                headers = {"Authorization": f"token {GITHUB_TOKEN}"}
+                r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=headers, timeout=10)
+                if r.status_code == 200:
+                    files = r.json().get("files", {})
+                    if "creds.json" in files:
+                        content = files["creds.json"]["content"]
+                        creds = json.loads(content)
+                        log.info("Token récupéré depuis le Gist GitHub.")
+            except Exception as e:
+                log.warning("Erreur lecture Gist : %s", e)
+
+        # 2. Si le Gist est vide, on utilise la variable Render de secours
         if not creds:
             if not PRONOTE_CREDS_JSON:
-                raise ValueError("PRONOTE_CREDS_JSON manquant.")
+                raise ValueError("PRONOTE_CREDS_JSON manquant et Gist vide.")
             creds = json.loads(PRONOTE_CREDS_JSON)
             log.info("Utilisation du token initial (depuis Render).")
 
+        # 3. Connexion
         self.client = pronotepy.Client.token_login(**creds)
         if not self.client.logged_in:
             raise RuntimeError("Token invalide ou expiré")
         
         log.info("Connecté avec succès !")
         
+        # 4. Sauvegarder le nouveau token dans le Gist (pour la prochaine fois)
         try:
             new_creds = self.client.export_credentials()
-            with open(CREDS_FILE, "w", encoding="utf-8") as f:
-                json.dump(new_creds, f)
-            log.warning("⚠️ NOUVEAU TOKEN GÉNÉRÉ (à copier dans Render si redémarrage) : %s", json.dumps(new_creds))
+            if GIST_ID and GITHUB_TOKEN:
+                headers = {
+                    "Authorization": f"token {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github.v3+json"
+                }
+                data = {"files": {"creds.json": {"content": json.dumps(new_creds)}}}
+                r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=headers, json=data, timeout=10)
+                if r.status_code == 200:
+                    log.info("Nouveau token sauvegardé dans le Gist GitHub.")
+                else:
+                    log.error("Erreur de sauvegarde Gist : %s", r.text)
+            else:
+                log.warning("Gist non configuré, le token ne sera pas persisté.")
         except Exception as e:
             log.error("Impossible de sauvegarder le token : %s", e)
 
+    # --- OUTILS ---
     def _load_seen(self, filename):
         try:
             with open(filename, "r", encoding="utf-8") as f:
@@ -98,7 +122,7 @@ class PronoteBot:
                 self.client = None
                 self.connect()
 
-    # --- 1. NOTES (toutes les 30 min) ---
+    # --- 1. NOTES ---
     def check_grades(self):
         self._refresh_session()
         seen = self._load_seen(SEEN_FILE)
@@ -108,19 +132,17 @@ class PronoteBot:
             overall = str(period.overall_average) if period.overall_average else "—"
             for g in period.grades:
                 gid = f"{g.grade}|{g.subject.name[:30]}|{(g.comment or '')[:40]}|{g.date.strftime('%Y-%m-%d')}"
-                if gid in seen:
-                    continue
-                
-                msg = (
-                    f"*Nouvelle note – {g.subject.name}*\n"
-                    f"📝 Note : *{g.grade}/{g.out_of}*\n"
-                    f"📅 Date : {g.date.strftime('%d/%m/%Y')}\n"
-                    f"💬 Appréciation : {g.comment or '—'}\n"
-                    f"🎯 Moyenne générale : {overall}"
-                )
-                self._telegram(msg)
-                seen.add(gid)
-                new_count += 1
+                if gid not in seen:
+                    msg = (
+                        f"*Nouvelle note – {g.subject.name}*\n"
+                        f"📝 Note : *{g.grade}/{g.out_of}*\n"
+                        f"📅 Date : {g.date.strftime('%d/%m/%Y')}\n"
+                        f"💬 Appréciation : {g.comment or '—'}\n"
+                        f"🎯 Moyenne générale : {overall}"
+                    )
+                    self._telegram(msg)
+                    seen.add(gid)
+                    new_count += 1
 
         if new_count:
             self._save_seen(SEEN_FILE, seen)
@@ -129,9 +151,7 @@ class PronoteBot:
     # --- 2. MENU CANTINE (Dimanche 17h) ---
     def check_menus(self):
         self._refresh_session()
-        log.info("Vérification des menus de la cantine…")
-        
-        # On récupère les menus de la semaine à venir (lundi à dimanche)
+        log.info("Vérification des menus…")
         today = date.today()
         next_monday = today + timedelta(days=(7 - today.weekday()))
         next_sunday = next_monday + timedelta(days=6)
@@ -143,56 +163,41 @@ class PronoteBot:
             return
 
         if not menus:
-            log.info("Aucun menu publié pour la semaine prochaine.")
             return
 
         msg = "*🍽️ Menus de la cantine (Semaine prochaine)*\n\n"
         has_content = False
         for menu in menus:
-            # On suppose que l'objet Menu a un attribut 'name' et 'date'
-            # Adapte les attributs selon ce que renvoie l'API
             if hasattr(menu, 'name') and menu.name:
                 msg += f"*{menu.date.strftime('%A %d/%m')}* : {menu.name}\n"
                 has_content = True
         
         if has_content:
             self._telegram(msg)
-            log.info("Menu de la cantine envoyé.")
-        else:
-            log.info("Les menus récupérés sont vides.")
 
-    # --- 3. DEVOIRS NON FAITS (Tous les soirs à 19h30) ---
+    # --- 3. DEVOIRS NON FAITS (Soir 19h30) ---
     def check_homework_daily(self):
         self._refresh_session()
-        
-        # Vérifier si on est en vacances ou un week-end
         today = date.today()
-        if today.weekday() >= 5:  # Samedi ou Dimanche
-            log.info("Week-end, pas de vérification des devoirs.")
+        
+        if today.weekday() >= 5: # Samedi ou Dimanche
             return
         
-        # On regarde les cours de demain. Si pas de cours, c'est peut-être un jour férié ou vacances.
         tomorrow = today + timedelta(days=1)
         try:
-            lessons_tomorrow = self.client.lessons(tomorrow, tomorrow)
-            if not lessons_tomorrow:
-                log.info("Pas de cours demain (vacances ou jour férié).")
+            lessons = self.client.lessons(tomorrow, tomorrow)
+            if not lessons: # Pas de cours (vacances/férié)
                 return
-        except Exception as e:
-            log.warning("Impossible de vérifier les cours de demain : %s", e)
+        except Exception:
+            pass
 
-        # On récupère les devoirs pour demain
         try:
             homeworks = self.client.homework(tomorrow, tomorrow)
-        except Exception as e:
-            log.warning("Impossible de récupérer les devoirs : %s", e)
+        except Exception:
             return
 
-        # On filtre les devoirs non faits
         unfinished = [hw for hw in homeworks if not hw.done]
-
         if not unfinished:
-            log.info("Tous les devoirs sont faits pour demain. Pas de message.")
             return
 
         msg = "*📚 Devoirs pour demain*\n\n"
@@ -200,31 +205,23 @@ class PronoteBot:
             msg += f"• *{hw.subject.name}* : {hw.description[:100]}\n"
 
         self._telegram(msg)
-        log.info("%d devoir(s) non fait(s) envoyé(s).", len(unfinished))
 
-    # --- 4. CHANGEMENTS DE COURS (Toutes les 30 min) ---
+    # --- 4. CHANGEMENTS DE COURS ---
     def check_lesson_changes(self):
         self._refresh_session()
-        seen_changes_file = "seen_lesson_changes.json"
-        seen_changes = self._load_seen(seen_changes_file)
+        seen = self._load_seen("seen_changes.json")
         new_count = 0
-
-        # On vérifie les cours des 3 prochains jours
         today = date.today()
-        end_date = today + timedelta(days=3)
         
         try:
-            lessons = self.client.lessons(today, end_date)
-        except Exception as e:
-            log.warning("Impossible de vérifier les changements de cours : %s", e)
+            lessons = self.client.lessons(today, today + timedelta(days=3))
+        except Exception:
             return
 
         for lesson in lessons:
-            # On ne s'intéresse qu'aux cours annulés ou modifiés
             if lesson.canceled or lesson.exempted:
-                # Identifiant unique pour éviter les doublons
-                change_id = f"{lesson.subject.name}|{lesson.start.strftime('%Y-%m-%d %H:%M')}|{lesson.canceled}"
-                if change_id not in seen_changes:
+                cid = f"{lesson.subject.name}|{lesson.start.strftime('%Y-%m-%d %H:%M')}"
+                if cid not in seen:
                     status = "ANNULÉ" if lesson.canceled else "DISPENSÉ"
                     msg = (
                         f"*⚠️ Changement de cours*\n"
@@ -233,12 +230,76 @@ class PronoteBot:
                         f"🚫 Statut : *{status}*"
                     )
                     self._telegram(msg)
-                    seen_changes.add(change_id)
+                    seen.add(cid)
                     new_count += 1
+        if new_count:
+            self._save_seen("seen_changes.json", seen)
 
-        if new_count > 0:
-            self._save_seen(seen_changes_file, seen_changes)
-            log.info("%d changement(s) de cours envoyé(s).", new_count)
+    # --- 5. INFORMATIONS ET SONDAGES ---
+    def check_informations(self):
+        self._refresh_session()
+        seen = self._load_seen("seen_infos.json")
+        new_count = 0
+        try:
+            infos = self.client.information_and_surveys()
+        except Exception:
+            return
+
+        for item in infos:
+            iid = f"{item.creation_date.strftime('%Y-%m-%d')}|{item.title}"
+            if iid not in seen:
+                is_sondage = "sondage" in str(item.category).lower() or "sondage" in item.title.lower()
+                icon = "📊" if is_sondage else "📢"
+                type_txt = "Nouveau Sondage" if is_sondage else "Nouvelle Information"
+                msg = f"*{icon} {type_txt}*\n📌 {item.title}\n📅 {item.creation_date.strftime('%d/%m/%Y')}"
+                self._telegram(msg)
+                seen.add(iid)
+                new_count += 1
+        if new_count:
+            self._save_seen("seen_infos.json", seen)
+
+    # --- 6. DISCUSSIONS ---
+    def check_discussions(self):
+        self._refresh_session()
+        seen = self._load_seen("seen_disc.json")
+        new_count = 0
+        try:
+            discussions = self.client.messages()
+        except Exception:
+            return
+
+        for disc in discussions:
+            for msg in disc.messages:
+                if not msg.read:
+                    mid = f"{disc.id}|{msg.id}"
+                    if mid not in seen:
+                        txt = f"*💬 Nouveau message – {msg.author}*\n📌 {disc.subject}\n📝 {msg.content[:150]}..."
+                        self._telegram(txt)
+                        seen.add(mid)
+                        new_count += 1
+        if new_count:
+            self._save_seen("seen_disc.json", seen)
+
+    # --- 7. ABSENCES ---
+    def check_absences(self):
+        self._refresh_session()
+        seen = self._load_seen("seen_abs.json")
+        new_count = 0
+        try:
+            absences = self.client.absences()
+        except Exception:
+            return
+
+        for ab in absences:
+            aid = f"{ab.from_date.strftime('%Y-%m-%d')}|{ab.to_date.strftime('%Y-%m-%d')}"
+            if aid not in seen:
+                msg = f"*⚠️ Absence/Retard*\n📅 {ab.from_date.strftime('%d/%m/%Y %H:%M')}\n💬 {ab.reasons or '—'}"
+                self._telegram(msg)
+                seen.add(aid)
+                new_count += 1
+        if new_count:
+            self._save_seen("seen_abs.json", seen)
+
 
 # ---------------------------------------------------------------------------
 # APPLICATION FLASK ET LANCEMENT
@@ -255,6 +316,11 @@ def manual_check():
     try:
         bot.check_grades()
         bot.check_lesson_changes()
+        bot.check_homework_daily()
+        bot.check_informations()
+        bot.check_discussions()
+        bot.check_absences()
+        bot.check_menus()
         return jsonify(status="done"), 200
     except Exception as e:
         log.exception("check a échoué")
@@ -268,18 +334,19 @@ def scheduler_loop():
 
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
     
-    # Tâches récurrentes
+    # Tâches régulières (toutes les 30 min)
     scheduler.add_job(bot.check_grades, "interval", minutes=CHECK_INTERVAL, next_run_time=datetime.now())
     scheduler.add_job(bot.check_lesson_changes, "interval", minutes=CHECK_INTERVAL)
+    scheduler.add_job(bot.check_informations, "interval", minutes=CHECK_INTERVAL)
+    scheduler.add_job(bot.check_discussions, "interval", minutes=CHECK_INTERVAL)
+    scheduler.add_job(bot.check_absences, "interval", minutes=CHECK_INTERVAL)
     
-    # Tâche du dimanche à 17h00 (Menu)
+    # Tâches planifiées
     scheduler.add_job(bot.check_menus, CronTrigger(day_of_week='sun', hour=17, minute=0))
-    
-    # Tâche tous les soirs à 19h30 (Devoirs)
     scheduler.add_job(bot.check_homework_daily, CronTrigger(hour=19, minute=30))
     
     scheduler.start()
-    log.info("Planificateur démarré (notes/cours: %d min, menus: dim 17h, devoirs: 19h30)", CHECK_INTERVAL)
+    log.info("Planificateur démarré.")
 
 if __name__ == "__main__":
     threading.Thread(target=scheduler_loop, daemon=True).start()
