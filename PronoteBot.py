@@ -17,6 +17,7 @@ from flask import Flask, jsonify
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # ---------------------------------------------------------------------------
 # Logs
@@ -44,30 +45,23 @@ class PronoteBot:
         self.client = None
         self.last_update_id = 0
 
-    # --- GESTION DU GIST (Mémoire et Token) ---
+    # --- GESTION DU GIST ---
     def _gist_request(self, method, data=None):
-        if not GIST_ID or not GITHUB_TOKEN:
-            return None
+        if not GIST_ID or not GITHUB_TOKEN: return None
         headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github.v3+json"}
         url = f"https://api.github.com/gists/{GIST_ID}"
         try:
-            if method == "GET":
-                r = requests.get(url, headers=headers, timeout=10)
-            elif method == "PATCH":
-                r = requests.patch(url, headers=headers, json=data, timeout=10)
-            if r.status_code == 200:
-                return r.json()
-        except Exception as e:
-            log.error("Erreur Gist API : %s", e)
+            if method == "GET": r = requests.get(url, headers=headers, timeout=10)
+            elif method == "PATCH": r = requests.patch(url, headers=headers, json=data, timeout=10)
+            if r.status_code == 200: return r.json()
+        except Exception as e: log.error("Erreur Gist API : %s", e)
         return None
 
     def _load_gist_file(self, filename, default=None):
         gist = self._gist_request("GET")
         if gist and "files" in gist and filename in gist["files"]:
-            try:
-                return json.loads(gist["files"][filename]["content"])
-            except:
-                pass
+            try: return json.loads(gist["files"][filename]["content"])
+            except: pass
         return default
 
     def _save_gist_file(self, filename, data):
@@ -81,14 +75,12 @@ class PronoteBot:
         if creds:
             log.info("Token récupéré depuis le Gist.")
         else:
-            if not PRONOTE_CREDS_JSON:
-                raise ValueError("Pas de token nulle part.")
+            if not PRONOTE_CREDS_JSON: raise ValueError("Pas de token nulle part.")
             creds = json.loads(PRONOTE_CREDS_JSON)
             log.info("Utilisation du token initial (Render).")
 
         self.client = pronotepy.Client.token_login(**creds)
-        if not self.client.logged_in:
-            raise RuntimeError("Token invalide")
+        if not self.client.logged_in: raise RuntimeError("Token invalide")
         
         log.info("Connecté avec succès !")
         new_creds = self.client.export_credentials()
@@ -96,11 +88,9 @@ class PronoteBot:
         log.info("Nouveau token sauvegardé dans le Gist.")
 
     def _refresh_session(self):
-        if self.client is None or not self.client.logged_in:
-            self.connect()
+        if self.client is None or not self.client.logged_in: self.connect()
         else:
-            try:
-                self.client.session_check()
+            try: self.client.session_check()
             except Exception:
                 log.warning("Session expirée, reconnexion…")
                 self.client = None
@@ -109,25 +99,18 @@ class PronoteBot:
     # --- ENVOIS TELEGRAM ---
     def _telegram(self, text, keyboard=None):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID, "text": text,
-            "parse_mode": "Markdown", "disable_web_page_preview": True
-        }
-        if keyboard:
-            payload["reply_markup"] = keyboard
-        try:
-            requests.post(url, json=payload, timeout=15)
-        except Exception as e:
-            log.error("Erreur Telegram : %s", e)
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
+        if keyboard: payload["reply_markup"] = keyboard
+        try: requests.post(url, json=payload, timeout=15)
+        except Exception as e: log.error("Erreur Telegram : %s", e)
 
     def _telegram_photo(self, photo_bytes, caption=""):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
         try:
             files = {'photo': ('image.png', photo_bytes)}
-            data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
+            data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'Markdown'}
             requests.post(url, data=data, files=files, timeout=30)
-        except Exception as e:
-            log.error("Erreur envoi photo : %s", e)
+        except Exception as e: log.error("Erreur envoi photo : %s", e)
 
     def _telegram_document(self, file_bytes, filename, caption=""):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
@@ -135,21 +118,29 @@ class PronoteBot:
             files = {'document': (filename, file_bytes)}
             data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
             requests.post(url, data=data, files=files, timeout=30)
-        except Exception as e:
-            log.error("Erreur envoi document : %s", e)
+        except Exception as e: log.error("Erreur envoi document : %s", e)
 
-    # --- CLAVIER INTERACTIF ---
+    # --- PARAMETRES DU MENU TELEGRAM (Nouveau) ---
+    def _set_telegram_commands(self):
+        """Configure le menu natif de Telegram avec les commandes."""
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
+        commands = [
+            {"command": "menu", "description": "Afficher le clavier principal"},
+            {"command": "notes", "description": "Voir les 5 dernières notes"},
+            {"command": "devoirs", "description": "Devoirs pour demain"},
+            {"command": "emploi", "description": "Emploi du temps de la semaine"},
+            {"command": "graphique", "description": "Voir l'évolution de la moyenne"},
+        ]
+        requests.post(url, json={"commands": commands})
+
     def _get_main_keyboard(self):
         return {
-            "inline_keyboard": [
-                [
-                    {"text": "📝 Dernières notes", "callback_data": "btn_notes"},
-                    {"text": "📚 Devoirs pour demain", "callback_data": "btn_devoirs"}
-                ],
-                [
-                    {"text": "📅 Emploi du temps", "callback_data": "btn_emploi"}
-                ]
-            ]
+            "keyboard": [
+                [{"text": "📝 Dernières notes"}, {"text": "📚 Devoirs pour demain"}],
+                [{"text": "📅 Emploi du temps"}, {"text": "📈 Graphique"}]
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True
         }
 
     # --- DÉTECTION DES VACANCES ---
@@ -157,14 +148,10 @@ class PronoteBot:
         today = date.today()
         for i in range(1, 6):
             next_day = today + timedelta(days=i)
-            if next_day.weekday() >= 5:
-                continue
+            if next_day.weekday() >= 5: continue
             try:
-                lessons = self.client.lessons(next_day, next_day)
-                if lessons:
-                    return False
-            except Exception:
-                pass
+                if self.client.lessons(next_day, next_day): return False
+            except Exception: pass
         return True
 
     # --- SYSTÈME ANTI-DOUBLON ---
@@ -196,23 +183,17 @@ class PronoteBot:
             self._save_gist_file("seen_grades.json", list(seen))
             log.info("%d nouvelle(s) note(s) envoyée(s)", new_count)
 
-    # --- 2. MENUS DÉTAILLÉS (Dimanche 18h) ---
+    # --- 2. MENUS DÉTAILLÉS ---
     def check_menus(self):
         today_str = date.today().strftime("%Y-%m-%d")
-        if self._check_already_sent("menus", today_str):
-            return
-
+        if self._check_already_sent("menus", today_str): return
         self._refresh_session()
         today = date.today()
         next_monday = today + timedelta(days=(7 - today.weekday()))
         next_sunday = next_monday + timedelta(days=6)
-        
-        try:
-            menus = self.client.menus(next_monday, next_sunday)
-        except Exception:
-            return
-        if not menus:
-            return
+        try: menus = self.client.menus(next_monday, next_sunday)
+        except Exception: return
+        if not menus: return
 
         msg = "*🍽️ Menus de la cantine (Semaine prochaine)*\n\n"
         has_content = False
@@ -220,30 +201,22 @@ class PronoteBot:
             if hasattr(menu, 'date') and menu.date:
                 jour_fr = JOURS_FR[menu.date.weekday()]
                 msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
-                if hasattr(menu, 'name') and menu.name:
-                    msg += f"_{menu.name}_\n"
+                if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
                 if hasattr(menu, 'meals') and menu.meals:
-                    for meal in menu.meals:
-                        msg += f"  • {meal}\n"
+                    for meal in menu.meals: msg += f"  • {meal}\n"
                     has_content = True
-                elif hasattr(menu, 'name') and menu.name:
-                    has_content = True
+                elif hasattr(menu, 'name') and menu.name: has_content = True
                 msg += "\n"
         if has_content:
             self._telegram(msg)
             self._mark_as_sent("menus", today_str)
 
-    # --- 3. DEVOIRS ET EMPLOI DU TEMPS (19h30) ---
+    # --- 3. DEVOIRS ET EMPLOI DU TEMPS ---
     def check_homework_and_timetable_daily(self):
         today_str = date.today().strftime("%Y-%m-%d")
-        if self._check_already_sent("devoirs_edt", today_str):
-            return
-
+        if self._check_already_sent("devoirs_edt", today_str): return
         self._refresh_session()
-        if self._is_vacation():
-            log.info("Mode vacances actif.")
-            return
-
+        if self._is_vacation(): return
         today = date.today()
         if today.weekday() >= 5: return
         tomorrow = today + timedelta(days=1)
@@ -254,13 +227,11 @@ class PronoteBot:
             if lessons:
                 timetable_msg = f"*📅 Emploi du temps de demain ({JOURS_FR[tomorrow.weekday()]} {tomorrow.strftime('%d/%m')})*\n"
                 for l in lessons:
-                    heure = l.start.strftime('%H:%M')
                     salle = f" - Salle {l.classroom}" if l.classroom else ""
                     prof = f" ({l.teacher_name})" if l.teacher_name else ""
-                    timetable_msg += f"• {heure} : *{l.subject.name}*{prof}{salle}\n"
+                    timetable_msg += f"• {l.start.strftime('%H:%M')} : *{l.subject.name}*{prof}{salle}\n"
                 timetable_msg += "\n"
-        except Exception as e:
-            log.warning("Impossible de récupérer l'emploi du temps : %s", e)
+        except Exception: pass
 
         homework_msg = ""
         try:
@@ -273,13 +244,10 @@ class PronoteBot:
                     if hw.files:
                         for f in hw.files:
                             if f.type == 1:
-                                try:
-                                    self._telegram_document(f.data, f.name, caption=f"📎 Pièce jointe : {hw.subject.name}")
-                                except Exception:
-                                    pass
+                                try: self._telegram_document(f.data, f.name, caption=f"📎 Pièce jointe : {hw.subject.name}")
+                                except: pass
                 homework_msg += "\n"
-        except Exception as e:
-            log.warning("Impossible de récupérer les devoirs : %s", e)
+        except Exception: pass
 
         if timetable_msg or homework_msg:
             self._telegram(timetable_msg + homework_msg)
@@ -289,27 +257,16 @@ class PronoteBot:
     def check_lesson_changes(self):
         self._refresh_session()
         old_lessons = self._load_gist_file("seen_lessons.json", {})
-        new_lessons = {}
-        changes = []
+        new_lessons, changes = {}, []
         today = date.today()
-        
         for i in range(0, 3):
             target_date = today + timedelta(days=i)
-            try:
-                lessons = self.client.lessons(target_date, target_date)
-            except Exception:
-                continue
-
+            try: lessons = self.client.lessons(target_date, target_date)
+            except Exception: continue
             for lesson in lessons:
                 lid = f"{target_date.strftime('%Y-%m-%d')}|{lesson.start.strftime('%H:%M')}|{lesson.subject.name}"
                 is_perm = getattr(lesson, 'is_permanent', False) or "perm" in str(lesson.subject.name).lower()
-                current_state = {
-                    "canceled": lesson.canceled or lesson.exempted,
-                    "room": getattr(lesson, 'classroom', ''),
-                    "subject": lesson.subject.name,
-                    "start": lesson.start.strftime("%d/%m à %H:%M"),
-                    "is_perm": is_perm
-                }
+                current_state = {"canceled": lesson.canceled or lesson.exempted, "room": getattr(lesson, 'classroom', ''), "subject": lesson.subject.name, "start": lesson.start.strftime("%d/%m à %H:%M"), "is_perm": is_perm}
                 new_lessons[lid] = current_state
 
                 if lid in old_lessons:
@@ -318,10 +275,8 @@ class PronoteBot:
                         changes.append(f"*⚠️ Cours ANNULÉ*\n📚 {lesson.subject.name}\n📅 {current_state['start']}")
                     elif current_state["room"] != old_state["room"] and not current_state["canceled"] and not current_state["is_perm"]:
                         changes.append(f"*🚪 Changement de salle*\n📚 {lesson.subject.name}\n📅 {current_state['start']}\n📍 {old_state['room']} ➡️ {current_state['room']}")
-
         if changes:
-            for change in changes:
-                self._telegram(change)
+            for change in changes: self._telegram(change)
         self._save_gist_file("seen_lessons.json", new_lessons)
 
     # --- 5. INFORMATIONS ---
@@ -329,35 +284,28 @@ class PronoteBot:
         self._refresh_session()
         seen = set(self._load_gist_file("seen_infos.json", []))
         new_count = 0
-        try:
-            infos = self.client.information_and_surveys()
-        except Exception:
-            return
-
+        try: infos = self.client.information_and_surveys()
+        except Exception: return
         for item in infos:
             iid = f"{item.creation_date.strftime('%Y-%m-%d')}|{item.title}"
             if iid not in seen:
                 is_sondage = "sondage" in str(item.category).lower() or "sondage" in item.title.lower()
                 icon = "📊" if is_sondage else "📢"
                 type_txt = "Nouveau Sondage" if is_sondage else "Nouvelle Information"
-                content_preview = f"\n📝 {item.content[:200]}..." if getattr(item, 'content', None) else ""
-                msg = f"*{icon} {type_txt}*\n📌 {item.title}\n📅 {item.creation_date.strftime('%d/%m/%Y')}{content_preview}"
+                content = f"\n📝 {item.content[:200]}..." if getattr(item, 'content', None) else ""
+                msg = f"*{icon} {type_txt}*\n📌 {item.title}\n📅 {item.creation_date.strftime('%d/%m/%Y')}{content}"
                 self._telegram(msg)
                 seen.add(iid)
                 new_count += 1
-        if new_count:
-            self._save_gist_file("seen_infos.json", list(seen))
+        if new_count: self._save_gist_file("seen_infos.json", list(seen))
 
     # --- 6. DISCUSSIONS ---
     def check_discussions(self):
         self._refresh_session()
         seen = set(self._load_gist_file("seen_disc.json", []))
         new_count = 0
-        try:
-            discussions = self.client.messages()
-        except Exception:
-            return
-
+        try: discussions = self.client.messages()
+        except Exception: return
         for disc in discussions:
             for msg in disc.messages:
                 if not msg.read:
@@ -367,19 +315,15 @@ class PronoteBot:
                         self._telegram(txt)
                         seen.add(mid)
                         new_count += 1
-        if new_count:
-            self._save_gist_file("seen_disc.json", list(seen))
+        if new_count: self._save_gist_file("seen_disc.json", list(seen))
 
     # --- 7. ABSENCES ---
     def check_absences(self):
         self._refresh_session()
         seen = set(self._load_gist_file("seen_abs.json", []))
         new_count = 0
-        try:
-            absences = self.client.absences()
-        except Exception:
-            return
-
+        try: absences = self.client.absences()
+        except Exception: return
         for ab in absences:
             aid = f"{ab.from_date.strftime('%Y-%m-%d')}|{ab.to_date.strftime('%Y-%m-%d')}"
             if aid not in seen:
@@ -387,8 +331,7 @@ class PronoteBot:
                 self._telegram(msg)
                 seen.add(aid)
                 new_count += 1
-        if new_count:
-            self._save_gist_file("seen_abs.json", list(seen))
+        if new_count: self._save_gist_file("seen_abs.json", list(seen))
 
     # --- 8. PUNITIONS ---
     def check_punishments(self):
@@ -404,10 +347,8 @@ class PronoteBot:
                         self._telegram(msg)
                         seen.add(pid)
                         new_count += 1
-        except Exception as e:
-            log.warning("Erreur punitions : %s", e)
-        if new_count:
-            self._save_gist_file("seen_punishments.json", list(seen))
+        except Exception: pass
+        if new_count: self._save_gist_file("seen_punishments.json", list(seen))
 
     # --- 9. COMPÉTENCES ---
     def check_skills(self):
@@ -425,27 +366,22 @@ class PronoteBot:
                             self._telegram(msg)
                             seen.add(aid)
                             new_count += 1
-        except Exception as e:
-            log.warning("Erreur compétences : %s", e)
-        if new_count:
-            self._save_gist_file("seen_skills.json", list(seen))
+        except Exception: pass
+        if new_count: self._save_gist_file("seen_skills.json", list(seen))
 
-    # --- 10. BILAN ET GRAPHIQUE (Dimanche 19h05) ---
+    # --- 10. BILAN ET GRAPHIQUE ---
     def send_weekly_summary(self):
         today_str = date.today().strftime("%Y-%m-%d")
-        if self._check_already_sent("bilan", today_str):
-            return
-
+        if self._check_already_sent("bilan", today_str): return
         self._refresh_session()
         if self._is_vacation():
-            self._telegram("🏖️ *Bonnes vacances !*\nLe bilan est en pause.")
+            self._telegram("🏖️ *Bonnes vacances !*")
             self._mark_as_sent("bilan", today_str)
             return
 
         today = date.today()
         one_week_ago = today - timedelta(days=7)
         new_grades_count, total_pts, total_out = 0, 0, 0
-
         try:
             for period in self.client.periods:
                 for g in period.grades:
@@ -457,53 +393,68 @@ class PronoteBot:
                                 total_pts += (note / bareme) * 20
                                 total_out += 1
                                 new_grades_count += 1
-                        except ValueError:
-                            pass
-        except Exception:
-            pass
+                        except ValueError: pass
+        except Exception: pass
 
         hw_count = 0
-        try:
-            homeworks = self.client.homework(today, today + timedelta(days=7))
-            hw_count = len(homeworks)
-        except Exception:
-            pass
+        try: hw_count = len(self.client.homework(today, today + timedelta(days=7)))
+        except Exception: pass
 
         moyenne_str = f"{(total_pts / total_out):.2f}/20" if total_out > 0 else "—"
-        msg = (
-            f"📊 *Bilan de la semaine*\n\n"
-            f"📝 Nouvelles notes : *{new_grades_count}*\n"
-            f"📈 Moyenne : *{moyenne_str}*\n\n"
-            f"📚 Devoirs à venir : *{hw_count}*\n"
-        )
+        msg = f"📊 *Bilan de la semaine*\n\n📝 Nouvelles notes : *{new_grades_count}*\n📈 Moyenne : *{moyenne_str}*\n\n📚 Devoirs à venir : *{hw_count}*\n"
         self._telegram(msg)
         self._mark_as_sent("bilan", today_str)
         self._generate_grade_chart()
 
     def _generate_grade_chart(self):
+        """Génère un beau graphique avec thème sombre."""
         try:
-            dates, averages = [], []
+            # Données : Liste de (date, note_sur_20)
+            grades_data = []
             for period in self.client.periods:
-                if period.overall_average:
-                    try:
-                        averages.append(float(str(period.overall_average).replace(',', '.')))
-                        dates.append(period.name)
-                    except ValueError:
-                        pass
-            if not dates:
-                return
-            plt.figure(figsize=(10, 5))
-            plt.plot(dates, averages, marker='o', linestyle='-', color='b')
-            plt.title("Évolution de la moyenne générale")
-            plt.ylabel("Moyenne /20")
-            plt.grid(True)
-            plt.xticks(rotation=45)
-            plt.tight_layout()
+                for g in period.grades:
+                    if g.grade and g.out_of:
+                        try:
+                            note = float(str(g.grade).replace(',', '.'))
+                            bareme = float(str(g.out_of).replace(',', '.'))
+                            if bareme > 0:
+                                note_sur_20 = (note / bareme) * 20
+                                grades_data.append((g.date, note_sur_20))
+                        except ValueError: pass
+            
+            if not grades_data: return
+
+            # Tri par date
+            grades_data.sort(key=lambda x: x[0])
+            dates = [g[0] for g in grades_data]
+            notes = [g[1] for g in grades_data]
+
+            # Création du graphique stylé
+            plt.style.use('dark_background')
+            fig, ax = plt.subplots(figsize=(10, 5))
+            
+            # Courbe
+            ax.plot(dates, notes, marker='o', linestyle='-', color='#00d2ff', linewidth=2, markersize=6, markerfacecolor='#ff0055')
+            
+            # Ligne de moyenne
+            moyenne_generale = sum(notes) / len(notes)
+            ax.axhline(y=moyenne_generale, color='#ff0055', linestyle='--', alpha=0.7, label=f'Moyenne ({moyenne_generale:.2f}/20)')
+            
+            # Habillage
+            ax.set_title("Évolution de tes notes (/20)", color='white', fontsize=14, pad=15)
+            ax.set_ylabel("Note", color='#aaaaaa')
+            ax.grid(color='#333333', linestyle=':', alpha=0.7)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
+            fig.autofmt_xdate(rotation=45)
+            ax.legend(facecolor='#222222', edgecolor='#555555')
+            
+            # Sauvegarde
             buf = io.BytesIO()
-            plt.savefig(buf, format='png')
+            plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
             buf.seek(0)
             plt.close()
-            self._telegram_photo(buf, caption="📈 *Évolution de ta moyenne*")
+            
+            self._telegram_photo(buf, caption="📈 *Ton évolution au fil du temps*")
         except Exception as e:
             log.error("Erreur graphique : %s", e)
 
@@ -528,20 +479,18 @@ class PronoteBot:
             time.sleep(1)
 
     def _handle_callback(self, data):
-        if data == "btn_notes":
-            self._handle_command("/notes")
-        elif data == "btn_devoirs":
-            self._handle_command("/devoirs")
-        elif data == "btn_emploi":
-            self._handle_command("/emploi")
+        if data == "btn_notes": self._handle_command("/notes")
+        elif data == "btn_devoirs": self._handle_command("/devoirs")
+        elif data == "btn_emploi": self._handle_command("/emploi")
 
     def _handle_command(self, text):
         text = text.lower().strip()
-        if text in ['/start', '/menu']:
-            welcome = "👋 *Bienvenue !*\nUtilise les boutons ci-dessous pour naviguer."
+        
+        if text in ['/start', '/menu', 'menu']:
+            welcome = "👋 *Bienvenue sur ton assistant Pronote !*\nChoisis une option ci-dessous ou tape une commande."
             self._telegram(welcome, keyboard=self._get_main_keyboard())
             
-        elif text == '/notes':
+        elif text in ['/notes', '📝 dernières notes']:
             self._refresh_session()
             msg = "*📝 Tes 5 dernières notes*\n\n"
             count = 0
@@ -554,7 +503,7 @@ class PronoteBot:
                 if count >= 5: break
             self._telegram(msg if count > 0 else "Aucune note trouvée.")
             
-        elif text == '/devoirs':
+        elif text in ['/devoirs', '📚 devoirs pour demain']:
             self._refresh_session()
             tomorrow = date.today() + timedelta(days=1)
             try:
@@ -570,7 +519,7 @@ class PronoteBot:
             except Exception:
                 self._telegram("Erreur lors de la récupération des devoirs.")
                 
-        elif text == '/emploi':
+        elif text in ['/emploi', '📅 emploi du temps']:
             self._refresh_session()
             today = date.today()
             msg = "*📅 Emploi du temps de la semaine*\n\n"
@@ -589,6 +538,11 @@ class PronoteBot:
                 except Exception:
                     pass
             self._telegram(msg if has_lessons else "Aucun cours cette semaine.")
+            
+        elif text in ['/graphique', '📈 graphique']:
+            self._refresh_session()
+            self._telegram("Génération du graphique en cours... ⏳")
+            self._generate_grade_chart()
 
 # ---------------------------------------------------------------------------
 # LANCEMENT
@@ -621,6 +575,7 @@ def manual_check():
 def scheduler_loop():
     try:
         bot.connect()
+        bot._set_telegram_commands() # Configure le menu Telegram au démarrage
     except Exception as e:
         log.warning("Connexion initiale échouée : %s", e)
 
