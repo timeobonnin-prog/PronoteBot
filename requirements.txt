@@ -1,4 +1,4 @@
-pronotepy==2.1.0
+pronotepy
 requests
 flask
 apscheduler
