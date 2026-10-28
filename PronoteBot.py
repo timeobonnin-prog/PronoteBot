@@ -10,10 +10,19 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, jsonify
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 log = logging.getLogger("pronotebot")
 
-# On récupère le JSON depuis Render
+# ---------------------------------------------------------------------------
+# Variables d'environnement Render
+# ---------------------------------------------------------------------------
+# On récupère le JSON complet généré par le QR Code
 PRONOTE_CREDS_JSON = os.environ.get("PRONOTE_CREDS_JSON")
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
@@ -29,8 +38,8 @@ class PronoteBot:
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
         
-        # 1. On cherche d'abord si on a un fichier de credentials récent (token rotatif)
         creds = None
+        # 1. On cherche d'abord si on a un fichier de credentials récent
         if CREDS_FILE.exists():
             try:
                 with open(CREDS_FILE, "r", encoding="utf-8") as f:
@@ -39,7 +48,7 @@ class PronoteBot:
             except Exception as e:
                 log.warning("Impossible de lire creds.json, on utilise la variable d'environnement.")
         
-        # 2. Sinon, on utilise le token initial de Render
+        # 2. Sinon, on utilise le token initial fourni par Render
         if not creds:
             if not PRONOTE_CREDS_JSON:
                 raise ValueError("PRONOTE_CREDS_JSON manquant dans les variables d'environnement.")
@@ -53,7 +62,7 @@ class PronoteBot:
         
         log.info("Connecté avec succès !")
         
-        # 4. TRÈS IMPORTANT : Pronote renouvelle le token à chaque connexion.
+        # 4. Pronote renouvelle le token à chaque connexion.
         # On l'exporte et on l'écrase dans le fichier local pour la prochaine fois.
         try:
             new_creds = self.client.export_credentials()
@@ -103,7 +112,9 @@ class PronoteBot:
         new_count = 0
 
         for period in self.client.periods:
-            overall = f"{period.overall_average:.2f}" if period.overall_average else "—"
+            # CORRECTION ICI : on utilise str() pour éviter le ValueError si c'est déjà du texte
+            overall = str(period.overall_average) if period.overall_average else "—"
+            
             for g in period.grades:
                 gid = self._grade_id(g)
                 if gid in seen:
