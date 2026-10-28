@@ -2,3 +2,4 @@ pronotepy
 requests
 flask
 apscheduler
+matplotlib
