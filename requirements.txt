@@ -1,13 +1,6 @@
-pronotepy==2.1.0
-google-api-python-client
-google_auth_oauthlib
-requests
-apscheduler
-pymstodo
-sqlalchemy
-psycopg2
 Pillow
-python-dotenv
 numpy
-pronotepy
 requests
+pronotepy==2.1.0
+flask
+apscheduler
