@@ -1,7 +1,4 @@
-Pillow
-numpy
-requests
 pronotepy==2.1.0
+requests
 flask
 apscheduler
-flask
