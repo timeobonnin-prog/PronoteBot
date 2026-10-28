@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pronotepy
+import pronotepy.ent                     # <-- nécessaire pour getattr
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from flask import Flask, jsonify
@@ -31,11 +32,11 @@ TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # Fichier mémoire des notes déjà envoyées
-# - Sur disque persistant Render : "/var/data/seen_grades.json"
-# - Sinon "./seen_grades.json" (perdu à chaque redeploy)
+# - Disque persistant Render : /var/data/seen_grades.json
+# - Sinon : ./seen_grades.json (perdu à chaque redeploy)
 SEEN_FILE = Path(os.environ.get("SEEN_FILE", "seen_grades.json"))
 
-# Intervalle de vérification en minutes
+# Intervalle de vérification (minutes)
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_MIN", "30"))
 
 
@@ -46,20 +47,33 @@ class PronoteBot:
     def __init__(self):
         self.client = None
 
-    # --- Connexion Pronote ---
+    # --- Résolution de la fonction ENT -------------------------------------
+    def _resolve_ent(self):
+        """Transforme PRONOTE_CAS (str) en fonction pronotepy.ent.<nom>."""
+        if not PRONOTE_CAS:
+            return None
+        if not hasattr(pronotepy.ent, PRONOTE_CAS):
+            raise ValueError(
+                f"ENT inconnu : '{PRONOTE_CAS}'. "
+                f"Vérifie la liste dans la doc pronotepy (ex: ile_de_france, "
+                f"monbureaunumerique, occitanie_montpellier, ac_reunion…)."
+            )
+        return getattr(pronotepy.ent, PRONOTE_CAS)
+
+    # --- Connexion Pronote -------------------------------------------------
     def connect(self):
-        ent = PRONOTE_CAS if PRONOTE_CAS else None
+        ent_func = self._resolve_ent()
         self.client = pronotepy.Client(
             PRONOTE_URL,
             username=PRONOTE_USERNAME,
             password=PRONOTE_PASSWORD,
-            ent=ent,
+            ent=ent_func,
         )
         if not self.client.logged_in:
             raise RuntimeError("Connexion Pronote échouée")
-        log.info("Connecté à Pronote (%s, ent=%s)", PRONOTE_URL, ent or "aucun")
+        log.info("Connecté à Pronote (ent=%s)", PRONOTE_CAS or "aucun")
 
-    # --- Persistance des notes déjà vues ---
+    # --- Persistance des notes déjà vues -----------------------------------
     def _load_seen(self):
         try:
             with open(SEEN_FILE, "r", encoding="utf-8") as f:
@@ -72,7 +86,7 @@ class PronoteBot:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump(sorted(seen), f)
 
-    # --- Envoi Telegram ---
+    # --- Envoi Telegram ----------------------------------------------------
     def _telegram(self, text):
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         try:
@@ -91,7 +105,7 @@ class PronoteBot:
         except requests.RequestException as e:
             log.exception("Erreur Telegram : %s", e)
 
-    # --- Identifiant stable d'une note ---
+    # --- Identifiant stable d'une note -------------------------------------
     @staticmethod
     def _grade_id(g):
         return "|".join([
@@ -101,7 +115,7 @@ class PronoteBot:
             g.date.strftime("%Y-%m-%d"),
         ])
 
-    # --- Détection + envoi des nouvelles notes ---
+    # --- Détection + envoi des nouvelles notes -----------------------------
     def check_grades(self):
         if self.client is None or not self.client.logged_in:
             self.connect()
@@ -151,10 +165,10 @@ class PronoteBot:
 
 
 # ---------------------------------------------------------------------------
-# Serveur HTTP de santé (obligatoire sur un Web Service Render)
+# Serveur HTTP de santé (Render Web Service)
 # ---------------------------------------------------------------------------
-app  = Flask(__name__)
-bot  = PronoteBot()
+app = Flask(__name__)
+bot = PronoteBot()
 
 
 @app.route("/")
@@ -179,7 +193,7 @@ def scheduler_loop():
     try:
         bot.connect()
     except Exception:
-        log.exception("Connexion initiale échouée")
+        log.exception("Connexion initiale échouée (le job réessaiera)")
 
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
     scheduler.add_job(
