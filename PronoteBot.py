@@ -303,17 +303,18 @@ class PronoteBot:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_disc.json", []))
             new_count = 0
-            discussions = self.client.messages()
-            for disc in discussions:
-                for msg in disc.messages:
-                    if not msg.read:
-                        mid = f"{disc.id}|{msg.id}"
-                        if mid not in seen:
-                            txt = f"*💬 Nouveau message – {msg.author}*\n📌 {disc.subject}\n📝 {msg.content[:150]}..."
-                            self._telegram(txt)
-                            seen.add(mid)
-                            new_count += 1
-            if new_count: self._save_gist_file("seen_disc.json", list(seen))
+            if hasattr(self.client, 'messages'):
+                discussions = self.client.messages()
+                for disc in discussions:
+                    for msg in disc.messages:
+                        if not msg.read:
+                            mid = f"{disc.id}|{msg.id}"
+                            if mid not in seen:
+                                txt = f"*💬 Nouveau message – {msg.author}*\n📌 {disc.subject}\n📝 {msg.content[:150]}..."
+                                self._telegram(txt)
+                                seen.add(mid)
+                                new_count += 1
+                if new_count: self._save_gist_file("seen_disc.json", list(seen))
         except Exception as e: log.error("Erreur check_discussions : %s", e)
 
     def check_absences(self):
@@ -696,19 +697,27 @@ class PronoteBot:
                 msg = "*📊 Tes moyennes*\n\n"
                 try:
                     current_period = self.client.current_period
-                    # --- CORRECTION ICI ---
+                    
                     try:
                         overall = float(str(current_period.overall_average).replace(',', '.'))
                         msg += f"🎯 *Générale* : {overall:.2f}/20\n\n"
                     except:
                         msg += f"🎯 *Générale* : {current_period.overall_average}/20\n\n"
 
-                    for subject, avg in current_period.averages.items():
+                    averages = getattr(current_period, 'averages', [])
+                    if isinstance(averages, dict):
+                        avg_iterable = averages.items()
+                    else:
+                        avg_iterable = [(getattr(avg, 'subject', getattr(avg, 'name', 'Matière')), getattr(avg, 'average', avg)) for avg in averages]
+
+                    for subject, avg in avg_iterable:
+                        sub_name = subject.name if hasattr(subject, 'name') else str(subject)
                         try:
                             avg_float = float(str(avg).replace(',', '.'))
-                            msg += f"• {subject} : {avg_float:.2f}\n"
+                            msg += f"• {sub_name} : {avg_float:.2f}\n"
                         except:
-                            msg += f"• {subject} : {avg}\n"
+                            msg += f"• {sub_name} : {avg}\n"
+                            
                     self._telegram(msg)
                 except Exception as e:
                     self._telegram(f"❌ Erreur : {str(e)}")
@@ -761,17 +770,20 @@ class PronoteBot:
             elif text in ['/messages', '💬 messages']:
                 self._telegram("⏳ _Recherche des messages..._")
                 self._refresh_session()
-                discussions = self.client.messages()
-                msg = "*💬 Tes derniers messages*\n\n"
-                count = 0
-                for disc in discussions:
-                    for m in disc.messages:
+                if not hasattr(self.client, 'messages'):
+                    self._telegram("ℹ️ La fonction de messagerie n'est pas disponible dans votre version de pronotepy.")
+                else:
+                    discussions = self.client.messages()
+                    msg = "*💬 Tes derniers messages*\n\n"
+                    count = 0
+                    for disc in discussions:
+                        for m in disc.messages:
+                            if count >= 5: break
+                            statut = "🟢" if not m.read else "⚪"
+                            msg += f"{statut} *{m.author}* ({m.date.strftime('%d/%m')}) :\n{disc.subject} - {m.content[:80]}...\n\n"
+                            count += 1
                         if count >= 5: break
-                        statut = "🟢" if not m.read else "⚪"
-                        msg += f"{statut} *{m.author}* ({m.date.strftime('%d/%m')}) :\n{disc.subject} - {m.content[:80]}...\n\n"
-                        count += 1
-                    if count >= 5: break
-                self._telegram(msg if count > 0 else "Aucun message.")
+                    self._telegram(msg if count > 0 else "Aucun message.")
                 
         except Exception as e:
             log.error(f"Erreur commande {text} : {e}")
