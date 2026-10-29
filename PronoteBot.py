@@ -186,7 +186,7 @@ class PronoteBot:
             log.info("Mise à jour du cache en cours...")
             cache = {}
 
-            # 1. Notes et Moyennes
+            # 1. Notes et Moyennes (Correction ici)
             cache["grades"] = []
             cache["averages"] = {}
             try:
@@ -195,9 +195,14 @@ class PronoteBot:
                 try: cache["averages"]["general"] = float(str(overall).replace(',', '.'))
                 except: cache["averages"]["general"] = str(overall)
                 
+                # Extraction des moyennes par matière
                 for avg in period.averages:
-                    subj = getattr(avg.subject, 'name', 'Inconnu') if hasattr(avg, 'subject') else 'Inconnu'
-                    val = getattr(avg, 'average', '—')
+                    # Pronote peut renvoyer l'objet de plusieurs façons
+                    subj = getattr(avg.subject, 'name', 'Matière') if hasattr(avg, 'subject') else 'Matière'
+                    
+                    # La valeur peut s'appeler 'average', 'student_average', 'value' ou être l'objet lui-même
+                    val = getattr(avg, 'average', getattr(avg, 'student_average', getattr(avg, 'value', avg)))
+                    
                     try: cache["averages"][subj] = float(str(val).replace(',', '.'))
                     except: cache["averages"][subj] = str(val)
 
@@ -271,7 +276,7 @@ class PronoteBot:
                     })
             except Exception as e: log.error("Erreur cache infos : %s", e)
 
-            # 6. Cantine
+            # 6. Cantine (Correction ici pour extraire les plats)
             cache["menus"] = []
             try:
                 next_monday = today + timedelta(days=(7 - today.weekday()))
@@ -281,10 +286,12 @@ class PronoteBot:
                         meals = []
                         if hasattr(m, 'meals') and m.meals:
                             for meal in m.meals:
+                                # Pronote renvoie souvent un dictionnaire avec la clé 'nom'
                                 if isinstance(meal, dict):
                                     name = meal.get('nom', meal.get('libelle', meal.get('name', '')))
                                     if name: meals.append(name)
-                                else: meals.append(str(meal))
+                                else:
+                                    meals.append(str(meal))
                         cache["menus"].append({
                             "date": f"{JOURS_FR[m.date.weekday()]} {m.date.strftime('%d/%m')}",
                             "name": getattr(m, 'name', ''),
@@ -347,7 +354,7 @@ class PronoteBot:
             elif text in ['/moyennes']:
                 msg = f"*📊 Tes moyennes*\n_(MàJ : {last_up})_\n\n"
                 avgs = cache.get("averages", {})
-                gen = avgs.pop("general", "—") # On extrait la générale
+                gen = avgs.pop("general", "—")
                 msg += f"🎯 *Générale* : {gen}/20\n\n"
                 for subj, val in avgs.items():
                     msg += f"• {subj} : {val}\n"
@@ -380,7 +387,7 @@ class PronoteBot:
                         msg += f"  • {l['time']} {l['subject']}{room}\n"
                     self._telegram(msg)
                 else:
-                    self._telegram("Aucun cours dans le cache.")
+                    self._telegram("Aucun cours dans le cache. (Normal si tu es en vacances !)")
 
             elif text in ['/messages', '💬 messages']:
                 msg = f"*💬 Messages non lus*\n_(MàJ : {last_up})_\n\n"
@@ -433,11 +440,6 @@ class PronoteBot:
                 if not grades:
                     self._telegram("Pas assez de notes pour faire un graphique.")
                     return
-                
-                # Recréation du graphique avec les données du cache
-                import matplotlib.pyplot as plt
-                import matplotlib.dates as mdates
-                from datetime import datetime
                 
                 grades_data = []
                 for g in grades:
@@ -497,7 +499,6 @@ class PronoteBot:
                             cb = update['callback_query']
                             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb['id']})
                             data = cb['data']
-                            # Redirection des boutons vers les commandes
                             if data == "btn_moyennes": self._handle_command("/moyennes")
                             elif data == "btn_graphique": self._handle_command("/graphique")
                             elif data == "btn_ds": self._handle_command("/ds")
@@ -541,7 +542,6 @@ def scheduler_loop():
     # --- CONFIGURATION DES HORAIRES (9h00, 12h00, 14h30, 19h30) ---
     heures = [(9, 0), (12, 0), (14, 30), (19, 30)]
     for h, m in heures:
-        # Une seule tâche par horaire : elle se connecte, télécharge tout et met à jour le cache.
         scheduler.add_job(bot.update_cache, CronTrigger(hour=h, minute=m))
 
     scheduler.start()
