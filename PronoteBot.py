@@ -13,20 +13,35 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify
 
+# Pour le graphique
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
+# Pour le proxy IPLoop
+try:
+    from iploop import IPLoop
+except ImportError:
+    IPLoop = None
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("pronotebot")
 
+# ---------------------------------------------------------------------------
+# Variables d'environnement
+# ---------------------------------------------------------------------------
 PRONOTE_CREDS_JSON = os.environ.get("PRONOTE_CREDS_JSON")
 TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 GIST_ID            = os.environ.get("GIST_ID")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN")
-CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "15"))
+IPLOOP_API_KEY     = os.environ.get("IPLOOP_API_KEY") # Nouvelle variable Proxy
+
+CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "30")) # 30 min pour éviter le ban
 
 JOURS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 COULEURS_COMPETENCES = {
@@ -37,6 +52,7 @@ class PronoteBot:
     def __init__(self):
         self.client = None
         self.last_update_id = 0
+        self.last_command_time = 0 # Anti-spam commandes
 
     # --- GESTION DU GIST ---
     def _gist_request(self, method, data=None):
@@ -64,6 +80,21 @@ class PronoteBot:
     # --- CONNEXION ---
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
+        
+        # --- CONFIGURATION DU PROXY IPLOOP ---
+        proxy_session = None
+        if IPLOOP_API_KEY and IPLoop:
+            try:
+                # On crée un client IPLoop avec une IP française
+                ip_client = IPLoop(api_key=IPLOOP_API_KEY, country="FR")
+                # On récupère une session (sticky = garde la même IP le temps de la session)
+                proxy_session = ip_client.session()
+                log.info("✅ Proxy IPLoop configuré avec succès.")
+            except Exception as e:
+                log.error("❌ Impossible de configurer le proxy IPLoop : %s", e)
+        else:
+            log.warning("⚠️ Pas de clé IPLoop ou librairie manquante. Connexion directe (risque de ban).")
+
         creds = self._load_gist_file("creds.json")
         if creds:
             log.info("Token récupéré depuis le Gist.")
@@ -72,19 +103,32 @@ class PronoteBot:
             creds = json.loads(PRONOTE_CREDS_JSON)
             log.info("Utilisation du token initial (Render).")
 
+        # Connexion à Pronote
         self.client = pronotepy.Client.token_login(**creds)
+        
+        # --- INJECTION DE LA SESSION PROXY ---
+        if proxy_session:
+            if hasattr(self.client, 'communication') and hasattr(self.client.communication, 'session'):
+                self.client.communication.session = proxy_session
+                log.info("Session proxy injectée dans pronotepy.communication.session")
+            elif hasattr(self.client, 'session'):
+                self.client.session = proxy_session
+                log.info("Session proxy injectée dans pronotepy.session")
+        # -------------------------------------
+
         if not self.client.logged_in: raise RuntimeError("Token invalide")
         
         log.info("Connecté avec succès !")
         new_creds = self.client.export_credentials()
         self._save_gist_file("creds.json", new_creds)
+        log.info("Nouveau token sauvegardé.")
 
     def _refresh_session(self):
         if self.client is None or not self.client.logged_in: self.connect()
         else:
             try: self.client.session_check()
-            except Exception:
-                log.warning("Session expirée, reconnexion…")
+            except Exception as e:
+                log.warning("Session expirée, reconnexion… : %s", e)
                 self.client = None
                 self.connect()
 
@@ -154,102 +198,107 @@ class PronoteBot:
 
     # --- TÂCHES AUTOMATIQUES ---
     def check_grades(self):
-        self._refresh_session()
-        seen = set(self._load_gist_file("seen_grades.json", []))
-        new_count = 0
-        for period in self.client.periods:
-            overall = str(period.overall_average) if period.overall_average else "—"
-            for g in period.grades:
-                gid = f"{g.grade}|{g.subject.name[:30]}|{(g.comment or '')[:40]}|{g.date.strftime('%Y-%m-%d')}"
-                if gid not in seen:
-                    note_str = f"{g.grade}/{g.out_of}" if g.grade else "Non noté"
-                    msg = f"*Nouvelle note – {g.subject.name}*\n📝 Note : *{note_str}*\n📅 Date : {g.date.strftime('%d/%m/%Y')}\n💬 Évaluation : {g.comment or '—'}\n🎯 Moyenne générale : {overall}"
-                    self._telegram(msg)
-                    seen.add(gid)
-                    new_count += 1
-        if new_count:
-            self._save_gist_file("seen_grades.json", list(seen))
+        try:
+            self._refresh_session()
+            seen = set(self._load_gist_file("seen_grades.json", []))
+            new_count = 0
+            for period in self.client.periods:
+                overall = str(period.overall_average) if period.overall_average else "—"
+                for g in period.grades:
+                    gid = f"{g.grade}|{g.subject.name[:30]}|{(g.comment or '')[:40]}|{g.date.strftime('%Y-%m-%d')}"
+                    if gid not in seen:
+                        note_str = f"{g.grade}/{g.out_of}" if g.grade else "Non noté"
+                        msg = f"*Nouvelle note – {g.subject.name}*\n📝 Note : *{note_str}*\n📅 Date : {g.date.strftime('%d/%m/%Y')}\n💬 Évaluation : {g.comment or '—'}\n🎯 Moyenne générale : {overall}"
+                        self._telegram(msg)
+                        seen.add(gid)
+                        new_count += 1
+            if new_count: self._save_gist_file("seen_grades.json", list(seen))
+        except Exception as e: log.error("Erreur check_grades : %s", e)
 
     def check_lesson_changes(self):
-        self._refresh_session()
-        old_lessons = self._load_gist_file("seen_lessons.json", {})
-        new_lessons, changes = {}, []
-        today = date.today()
-        for i in range(0, 3):
-            target_date = today + timedelta(days=i)
-            try: lessons = self.client.lessons(target_date, target_date)
-            except Exception: continue
-            for lesson in lessons:
-                lid = f"{target_date.strftime('%Y-%m-%d')}|{lesson.start.strftime('%H:%M')}|{lesson.subject.name}"
-                is_perm = getattr(lesson, 'is_permanent', False) or "perm" in str(lesson.subject.name).lower()
-                current_state = {"canceled": lesson.canceled or lesson.exempted, "room": getattr(lesson, 'classroom', ''), "subject": lesson.subject.name, "start": lesson.start.strftime("%d/%m à %H:%M"), "is_perm": is_perm}
-                new_lessons[lid] = current_state
-                if lid in old_lessons:
-                    old_state = old_lessons[lid]
-                    if current_state["canceled"] and not old_state["canceled"] and not old_state["is_perm"]:
-                        changes.append(f"*⚠️ Cours ANNULÉ*\n📚 {lesson.subject.name}\n📅 {current_state['start']}")
-                    elif current_state["room"] != old_state["room"] and not current_state["canceled"] and not current_state["is_perm"]:
-                        changes.append(f"*🚪 Changement de salle*\n📚 {lesson.subject.name}\n📅 {current_state['start']}\n📍 {old_state['room']} ➡️ {current_state['room']}")
-        if changes:
-            for change in changes: self._telegram(change)
-        self._save_gist_file("seen_lessons.json", new_lessons)
+        try:
+            self._refresh_session()
+            old_lessons = self._load_gist_file("seen_lessons.json", {})
+            new_lessons, changes = {}, []
+            today = date.today()
+            for i in range(0, 3):
+                target_date = today + timedelta(days=i)
+                lessons = self.client.lessons(target_date, target_date)
+                for lesson in lessons:
+                    lid = f"{target_date.strftime('%Y-%m-%d')}|{lesson.start.strftime('%H:%M')}|{lesson.subject.name}"
+                    is_perm = getattr(lesson, 'is_permanent', False) or "perm" in str(lesson.subject.name).lower()
+                    current_state = {"canceled": lesson.canceled or lesson.exempted, "room": getattr(lesson, 'classroom', ''), "subject": lesson.subject.name, "start": lesson.start.strftime("%d/%m à %H:%M"), "is_perm": is_perm}
+                    new_lessons[lid] = current_state
+                    if lid in old_lessons:
+                        old_state = old_lessons[lid]
+                        if current_state["canceled"] and not old_state["canceled"] and not old_state["is_perm"]:
+                            changes.append(f"*⚠️ Cours ANNULÉ*\n📚 {lesson.subject.name}\n📅 {current_state['start']}")
+                        elif current_state["room"] != old_state["room"] and not current_state["canceled"] and not current_state["is_perm"]:
+                            changes.append(f"*🚪 Changement de salle*\n📚 {lesson.subject.name}\n📅 {current_state['start']}\n📍 {old_state['room']} ➡️ {current_state['room']}")
+            if changes:
+                for change in changes: self._telegram(change)
+            self._save_gist_file("seen_lessons.json", new_lessons)
+        except Exception as e: log.error("Erreur check_lesson_changes : %s", e)
 
     def check_informations(self):
-        self._refresh_session()
-        seen = set(self._load_gist_file("seen_infos.json", []))
-        new_count = 0
-        try: infos = self.client.information_and_surveys()
-        except Exception: return
-        for item in infos:
-            iid = f"{item.creation_date.strftime('%Y-%m-%d')}|{item.title}"
-            if iid not in seen:
-                is_sondage = "sondage" in str(item.category).lower() or "sondage" in item.title.lower()
-                icon = "📊" if is_sondage else "📢"
-                type_txt = "Nouveau Sondage" if is_sondage else "Nouvelle Information"
-                content = f"\n📝 {item.content[:200]}..." if getattr(item, 'content', None) else ""
-                msg = f"*{icon} {type_txt}*\n📌 {item.title}\n📅 {item.creation_date.strftime('%d/%m/%Y')}{content}"
-                self._telegram(msg)
-                seen.add(iid)
-                new_count += 1
-        if new_count: self._save_gist_file("seen_infos.json", list(seen))
+        try:
+            self._refresh_session()
+            seen = set(self._load_gist_file("seen_infos.json", []))
+            new_count = 0
+            infos = self.client.information_and_surveys()
+            for item in infos:
+                iid = f"{item.creation_date.strftime('%Y-%m-%d')}|{item.title}"
+                if iid not in seen:
+                    is_sondage = "sondage" in str(item.category).lower() or "sondage" in item.title.lower()
+                    icon = "📊" if is_sondage else "📢"
+                    type_txt = "Nouveau Sondage" if is_sondage else "Nouvelle Information"
+                    content = f"\n📝 {item.content[:200]}..." if getattr(item, 'content', None) else ""
+                    msg = f"*{icon} {type_txt}*\n📌 {item.title}\n📅 {item.creation_date.strftime('%d/%m/%Y')}{content}"
+                    self._telegram(msg)
+                    seen.add(iid)
+                    new_count += 1
+            if new_count: self._save_gist_file("seen_infos.json", list(seen))
+        except Exception as e: log.error("Erreur check_informations : %s", e)
 
     def check_discussions(self):
-        self._refresh_session()
-        seen = set(self._load_gist_file("seen_disc.json", []))
-        new_count = 0
-        try: discussions = self.client.messages()
-        except Exception: return
-        for disc in discussions:
-            for msg in disc.messages:
-                if not msg.read:
-                    mid = f"{disc.id}|{msg.id}"
-                    if mid not in seen:
-                        txt = f"*💬 Nouveau message – {msg.author}*\n📌 {disc.subject}\n📝 {msg.content[:150]}..."
-                        self._telegram(txt)
-                        seen.add(mid)
-                        new_count += 1
-        if new_count: self._save_gist_file("seen_disc.json", list(seen))
+        try:
+            self._refresh_session()
+            seen = set(self._load_gist_file("seen_disc.json", []))
+            new_count = 0
+            discussions = self.client.messages()
+            for disc in discussions:
+                for msg in disc.messages:
+                    if not msg.read:
+                        mid = f"{disc.id}|{msg.id}"
+                        if mid not in seen:
+                            txt = f"*💬 Nouveau message – {msg.author}*\n📌 {disc.subject}\n📝 {msg.content[:150]}..."
+                            self._telegram(txt)
+                            seen.add(mid)
+                            new_count += 1
+            if new_count: self._save_gist_file("seen_disc.json", list(seen))
+        except Exception as e: log.error("Erreur check_discussions : %s", e)
 
     def check_absences(self):
-        self._refresh_session()
-        seen = set(self._load_gist_file("seen_abs.json", []))
-        new_count = 0
-        try: absences = self.client.absences()
-        except Exception: return
-        for ab in absences:
-            aid = f"{ab.from_date.strftime('%Y-%m-%d')}|{ab.to_date.strftime('%Y-%m-%d')}"
-            if aid not in seen:
-                msg = f"*⚠️ Absence/Retard*\n📅 {ab.from_date.strftime('%d/%m/%Y %H:%M')}\n💬 {ab.reasons or '—'}"
-                self._telegram(msg)
-                seen.add(aid)
-                new_count += 1
-        if new_count: self._save_gist_file("seen_abs.json", list(seen))
+        try:
+            self._refresh_session()
+            seen = set(self._load_gist_file("seen_abs.json", []))
+            new_count = 0
+            absences = self.client.absences()
+            for ab in absences:
+                aid = f"{ab.from_date.strftime('%Y-%m-%d')}|{ab.to_date.strftime('%Y-%m-%d')}"
+                if aid not in seen:
+                    msg = f"*⚠️ Absence/Retard*\n📅 {ab.from_date.strftime('%d/%m/%Y %H:%M')}\n💬 {ab.reasons or '—'}"
+                    self._telegram(msg)
+                    seen.add(aid)
+                    new_count += 1
+            if new_count: self._save_gist_file("seen_abs.json", list(seen))
+        except Exception as e: log.error("Erreur check_absences : %s", e)
 
     def check_punishments(self):
-        self._refresh_session()
-        seen = set(self._load_gist_file("seen_punishments.json", []))
-        new_count = 0
         try:
+            self._refresh_session()
+            seen = set(self._load_gist_file("seen_punishments.json", []))
+            new_count = 0
             for period in self.client.periods:
                 for pun in period.punishments:
                     pid = f"{pun.id}"
@@ -258,14 +307,14 @@ class PronoteBot:
                         self._telegram(msg)
                         seen.add(pid)
                         new_count += 1
-        except Exception: pass
-        if new_count: self._save_gist_file("seen_punishments.json", list(seen))
+            if new_count: self._save_gist_file("seen_punishments.json", list(seen))
+        except Exception as e: log.error("Erreur check_punishments : %s", e)
 
     def check_skills(self):
-        self._refresh_session()
-        seen = set(self._load_gist_file("seen_skills.json", []))
-        new_count = 0
         try:
+            self._refresh_session()
+            seen = set(self._load_gist_file("seen_skills.json", []))
+            new_count = 0
             for period in self.client.periods:
                 for ev in period.evaluations:
                     for acq in ev.acquisitions:
@@ -276,20 +325,20 @@ class PronoteBot:
                             self._telegram(msg)
                             seen.add(aid)
                             new_count += 1
-        except Exception: pass
-        if new_count: self._save_gist_file("seen_skills.json", list(seen))
+            if new_count: self._save_gist_file("seen_skills.json", list(seen))
+        except Exception as e: log.error("Erreur check_skills : %s", e)
 
     def check_homework_and_timetable_daily(self):
         today_str = date.today().strftime("%Y-%m-%d")
         if self._check_already_sent("devoirs_edt", today_str): return
-        self._refresh_session()
-        if self._is_vacation(): return
-        today = date.today()
-        if today.weekday() >= 5: return
-        tomorrow = today + timedelta(days=1)
-        
-        timetable_msg = ""
         try:
+            self._refresh_session()
+            if self._is_vacation(): return
+            today = date.today()
+            if today.weekday() >= 5: return
+            tomorrow = today + timedelta(days=1)
+            
+            timetable_msg = ""
             lessons = self.client.lessons(tomorrow, tomorrow)
             if lessons:
                 timetable_msg = f"*📅 Emploi du temps de demain ({JOURS_FR[tomorrow.weekday()]} {tomorrow.strftime('%d/%m')})*\n"
@@ -298,10 +347,8 @@ class PronoteBot:
                     prof = f" ({l.teacher_name})" if l.teacher_name else ""
                     timetable_msg += f"• {l.start.strftime('%H:%M')} : *{l.subject.name}*{prof}{salle}\n"
                 timetable_msg += "\n"
-        except Exception: pass
 
-        homework_msg = ""
-        try:
+            homework_msg = ""
             homeworks = self.client.homework(tomorrow, tomorrow)
             unfinished = [hw for hw in homeworks if not hw.done]
             if unfinished:
@@ -314,52 +361,53 @@ class PronoteBot:
                                 try: self._telegram_document(f.data, f.name, caption=f"📎 Pièce jointe : {hw.subject.name}")
                                 except: pass
                 homework_msg += "\n"
-        except Exception: pass
 
-        if timetable_msg or homework_msg:
-            self._telegram(timetable_msg + homework_msg)
-            self._mark_as_sent("devoirs_edt", today_str)
+            if timetable_msg or homework_msg:
+                self._telegram(timetable_msg + homework_msg)
+                self._mark_as_sent("devoirs_edt", today_str)
+        except Exception as e: log.error("Erreur devoirs/edt : %s", e)
 
     def check_menus(self):
         today_str = date.today().strftime("%Y-%m-%d")
         if self._check_already_sent("menus", today_str): return
-        self._refresh_session()
-        today = date.today()
-        next_monday = today + timedelta(days=(7 - today.weekday()))
-        next_sunday = next_monday + timedelta(days=6)
-        try: menus = self.client.menus(next_monday, next_sunday)
-        except Exception: return
-        if not menus: return
+        try:
+            self._refresh_session()
+            today = date.today()
+            next_monday = today + timedelta(days=(7 - today.weekday()))
+            next_sunday = next_monday + timedelta(days=6)
+            menus = self.client.menus(next_monday, next_sunday)
+            if not menus: return
 
-        msg = "*🍽️ Menus de la cantine (Semaine prochaine)*\n\n"
-        has_content = False
-        for menu in menus:
-            if hasattr(menu, 'date') and menu.date:
-                jour_fr = JOURS_FR[menu.date.weekday()]
-                msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
-                if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
-                if hasattr(menu, 'meals') and menu.meals:
-                    for meal in menu.meals: msg += f"  • {meal}\n"
-                    has_content = True
-                elif hasattr(menu, 'name') and menu.name: has_content = True
-                msg += "\n"
-        if has_content:
-            self._telegram(msg)
-            self._mark_as_sent("menus", today_str)
+            msg = "*🍽️ Menus de la cantine (Semaine prochaine)*\n\n"
+            has_content = False
+            for menu in menus:
+                if hasattr(menu, 'date') and menu.date:
+                    jour_fr = JOURS_FR[menu.date.weekday()]
+                    msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
+                    if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
+                    if hasattr(menu, 'meals') and menu.meals:
+                        for meal in menu.meals: msg += f"  • {meal}\n"
+                        has_content = True
+                    elif hasattr(menu, 'name') and menu.name: has_content = True
+                    msg += "\n"
+            if has_content:
+                self._telegram(msg)
+                self._mark_as_sent("menus", today_str)
+        except Exception as e: log.error("Erreur menus : %s", e)
 
     def send_weekly_summary(self):
         today_str = date.today().strftime("%Y-%m-%d")
         if self._check_already_sent("bilan", today_str): return
-        self._refresh_session()
-        if self._is_vacation():
-            self._telegram("🏖️ *Bonnes vacances !*")
-            self._mark_as_sent("bilan", today_str)
-            return
-
-        today = date.today()
-        one_week_ago = today - timedelta(days=7)
-        new_grades_count, total_pts, total_out = 0, 0, 0
         try:
+            self._refresh_session()
+            if self._is_vacation():
+                self._telegram("🏖️ *Bonnes vacances !*")
+                self._mark_as_sent("bilan", today_str)
+                return
+
+            today = date.today()
+            one_week_ago = today - timedelta(days=7)
+            new_grades_count, total_pts, total_out = 0, 0, 0
             for period in self.client.periods:
                 for g in period.grades:
                     if g.date >= one_week_ago and g.date <= today and g.grade and g.out_of:
@@ -371,17 +419,17 @@ class PronoteBot:
                                 total_out += 1
                                 new_grades_count += 1
                         except ValueError: pass
-        except Exception: pass
 
-        hw_count = 0
-        try: hw_count = len(self.client.homework(today, today + timedelta(days=7)))
-        except Exception: pass
+            hw_count = 0
+            try: hw_count = len(self.client.homework(today, today + timedelta(days=7)))
+            except Exception: pass
 
-        moyenne_str = f"{(total_pts / total_out):.2f}/20" if total_out > 0 else "—"
-        msg = f"📊 *Bilan de la semaine*\n\n📝 Nouvelles notes : *{new_grades_count}*\n📈 Moyenne : *{moyenne_str}*\n\n📚 Devoirs à venir : *{hw_count}*\n"
-        self._telegram(msg)
-        self._mark_as_sent("bilan", today_str)
-        self._generate_grade_chart()
+            moyenne_str = f"{(total_pts / total_out):.2f}/20" if total_out > 0 else "—"
+            msg = f"📊 *Bilan de la semaine*\n\n📝 Nouvelles notes : *{new_grades_count}*\n📈 Moyenne : *{moyenne_str}*\n\n📚 Devoirs à venir : *{hw_count}*\n"
+            self._telegram(msg)
+            self._mark_as_sent("bilan", today_str)
+            self._generate_grade_chart()
+        except Exception as e: log.error("Erreur bilan : %s", e)
 
     def _generate_grade_chart(self):
         try:
@@ -422,18 +470,31 @@ class PronoteBot:
         except Exception as e:
             log.error("Erreur graphique : %s", e)
 
-    # --- 11. POLLING ET COMMANDES TELEGRAM ---
+    # --- POLLING ET COMMANDES TELEGRAM ---
     def _poll_telegram(self):
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
+        log.info("Écoute des messages Telegram en cours...")
+        
         while True:
             try:
                 url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-                params = {'offset': self.last_update_id + 1, 'timeout': 30}
-                r = requests.get(url, params=params, timeout=35)
+                params = {'offset': self.last_update_id + 1, 'timeout': 20}
+                r = requests.get(url, params=params, timeout=25)
+                
                 if r.status_code == 200:
-                    for update in r.json().get('result', []):
+                    data = r.json()
+                    updates = data.get('result', [])
+                    if updates:
+                        log.info(f"📥 {len(updates)} message(s) reçu(s) de Telegram.")
+                    
+                    for update in updates:
                         self.last_update_id = update['update_id']
                         if 'message' in update and 'text' in update['message']:
+                            log.info(f"💬 Commande reçue : {update['message']['text']}")
                             self._handle_command(update['message']['text'])
+                else:
+                    log.error(f"Erreur Telegram API ({r.status_code}) : {r.text}")
+                    
             except Exception as e:
                 log.error("Erreur polling Telegram : %s", e)
             time.sleep(1)
@@ -441,6 +502,13 @@ class PronoteBot:
     def _handle_command(self, text):
         text = text.lower().strip()
         
+        # Anti-spam : 10 secondes entre chaque commande
+        if time.time() - self.last_command_time < 10 and text not in ['/start', '/menu', 'menu']:
+            self._telegram("⏳ _Doucement ! Attends 10 secondes entre chaque commande pour ne pas faire bannir le serveur par Pronote._")
+            return
+            
+        self.last_command_time = time.time()
+
         try:
             if text in ['/start', '/menu', 'menu']:
                 welcome = "👋 *Bienvenue !*\nChoisis une option."
@@ -499,7 +567,7 @@ class PronoteBot:
                 
         except Exception as e:
             log.error(f"Erreur commande {text} : {e}")
-            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nLe serveur Render était probablement en veille. Réessaie dans 30 secondes.")
+            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nL'IP est sûrement bloquée, ou le proxy a échoué. Réessaie plus tard.")
 
 # ---------------------------------------------------------------------------
 # LANCEMENT
