@@ -320,14 +320,12 @@ class PronoteBot:
             
         try:
             grades_data = []
-            # On recrée des dates approximatives à partir du cache
             for g in cache["grades"]:
                 if g["grade"] != "Non noté" and g["out_of"]:
                     try:
                         note = float(g["grade"].replace(',', '.'))
                         bareme = float(g["out_of"].replace(',', '.'))
                         if bareme > 0:
-                            # On utilise la date du cache
                             d = datetime.strptime(g["date"], "%d/%m/%Y")
                             grades_data.append((d, (note / bareme) * 20))
                     except ValueError: pass
@@ -375,11 +373,9 @@ class PronoteBot:
             return
             
         elif text in ['/sync', '🔄 actualiser (sync)']:
-            # Lancement d'une synchro manuelle dans un thread séparé pour ne pas bloquer
             threading.Thread(target=self.sync_data, args=(True,)).start()
             return
 
-        # Pour toutes les autres commandes, on lit le CACHE
         cache = self._load_gist_file("pronote_cache.json", {})
         last_sync = cache.get("last_sync", "Inconnue")
         
@@ -404,7 +400,6 @@ class PronoteBot:
                 
             elif text in ['/devoirs', '📚 devoirs demain']:
                 msg = f"*📚 Devoirs pour les prochains jours* (Sync : {last_sync})\n\n"
-                # On filtre uniquement pour demain dans le cache
                 tomorrow_str = JOURS_FR[(date.today() + timedelta(days=1)).weekday()] + " " + (date.today() + timedelta(days=1)).strftime('%d/%m')
                 hws = [h for h in cache.get("homework", []) if h["date"] == tomorrow_str]
                 for h in hws:
@@ -520,14 +515,9 @@ def force_sync():
     return jsonify(status="syncing"), 200
 
 def scheduler_loop():
-    # Synchronisation automatique une fois par jour à 18h00
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
-    
-    # On lance une sync au démarrage de Render
     time.sleep(5)
     bot.sync_data(manual=False)
-    
-    # Puis tous les jours à 18h
     scheduler.add_job(bot.sync_data, CronTrigger(hour=18, minute=0))
     
     scheduler.start()
@@ -539,12 +529,3 @@ if __name__ == "__main__":
     threading.Thread(target=scheduler_loop, daemon=True).start()
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-```### 🚀 Comment ça marche maintenant ?
-
-1. **La synchronisation automatique** : Le bot se connecte à Pronote **une seule fois par jour à 18h00** (et une fois au démarrage de Render). Il télécharge tout et sauvegarde dans le Gist. Tu n'as rien à faire.
-2. **Le bouton `🔄 Actualiser (Sync)`** : Si tu veux les dernières notes tout de suite, clique sur ce bouton. Le bot fera une sync manuelle immédiate.
-3. **Tous les autres boutons** : Ils lisent les données du Gist instantanément, sans contacter Pronote. Tu ne verras plus jamais l'erreur 23 (sauf si tu spam le bouton Sync).
-
-*(Note : J'ai supprimé la vérification automatique des pièces jointes PDF pour l'instant, car on va se concentrer sur le texte pour le mode Cache. Si tu veux les fichiers, tu pourras me le redemander plus tard).*
-
-Attends que Render redémarre, puis clique sur `/sync` pour faire ta première mise à jour. Ensuite, teste tes boutons, tu verras que c'est ultra rapide !
