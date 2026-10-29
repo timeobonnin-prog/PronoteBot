@@ -62,8 +62,10 @@ class PronoteBot:
     def _load_gist_file(self, filename, default=None):
         gist = self._gist_request("GET")
         if gist and "files" in gist and filename in gist["files"]:
-            try: return json.loads(gist["files"][filename]["content"])
-            except: pass
+            content = gist["files"][filename]["content"]
+            if not content or content.strip() == "": return default
+            try: return json.loads(content)
+            except json.JSONDecodeError: return default
         return default
 
     def _save_gist_file(self, filename, data):
@@ -89,9 +91,15 @@ class PronoteBot:
         if creds:
             log.info("Token récupéré depuis le Gist.")
         else:
-            if not PRONOTE_CREDS_JSON: raise ValueError("Pas de token nulle part.")
-            creds = json.loads(PRONOTE_CREDS_JSON)
-            log.info("Utilisation du token initial (Render).")
+            if not PRONOTE_CREDS_JSON: 
+                raise ValueError("Le Gist est vide et PRONOTE_CREDS_JSON est manquant sur Render.")
+            try:
+                creds = json.loads(PRONOTE_CREDS_JSON)
+                log.info("Utilisation du token initial (Render).")
+            except json.JSONDecodeError as e:
+                log.error("❌ Le PRONOTE_CREDS_JSON est mal formaté : %s", e)
+                self._telegram("❌ *Erreur de token* : Le JSON dans Render est mal formaté (vérifie les virgules et les sauts de ligne).")
+                raise
 
         # Connexion
         self.client = pronotepy.Client.token_login(**creds)
