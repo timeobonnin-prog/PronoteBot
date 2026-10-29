@@ -33,7 +33,9 @@ TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 GIST_ID            = os.environ.get("GIST_ID")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN")
-IPLOOP_API_KEY     = os.environ.get("IPLOOP_API_KEY")
+
+# Configuration du proxy (Webshare)
+PROXY_URL          = os.environ.get("PROXY_URL")
 
 CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "30")) 
 
@@ -97,22 +99,21 @@ class PronoteBot:
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
         
-        # --- CONFIGURATION DU PROXY IPLOOP ---
+        # --- CONFIGURATION DU PROXY WEBSHARE ---
         proxy_session = None
-        if IPLOOP_API_KEY:
+        if PROXY_URL:
             try:
-                # Format d'authentification standard IPLoop
-                proxy_url = f"http://iploop:{IPLOOP_API_KEY}-country-FR@proxy.iploop.io:8880"
-                
                 proxy_session = requests.Session()
-                proxy_session.trust_env = False  # Empêche les variables système de prendre le dessus
+                proxy_session.trust_env = False
                 proxy_session.proxies.update({
-                    "http": proxy_url,
-                    "https": proxy_url
+                    "http": PROXY_URL,
+                    "https": PROXY_URL
                 })
-                log.info("✅ Session proxy IPLoop configurée.")
+                log.info("✅ Session proxy Webshare configurée.")
             except Exception as e:
-                log.error("❌ Impossible de configurer le proxy IPLoop : %s", e)
+                log.error("❌ Impossible de configurer le proxy Webshare : %s", e)
+        else:
+            log.warning("⚠️ Aucun PROXY_URL défini. Connexion directe.")
 
         creds = self._load_gist_file("creds.json")
         if creds:
