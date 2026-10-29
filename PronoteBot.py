@@ -166,7 +166,6 @@ class PronoteBot:
 
     # --- CLAVIERS ---
     def _get_main_keyboard(self):
-        # Clavier persistant (mis à jour avec Messages)
         return {
             "keyboard": [
                 [{"text": "📝 Notes"}, {"text": "📚 Devoirs demain"}],
@@ -179,7 +178,6 @@ class PronoteBot:
         }
 
     def _get_inline_menu(self):
-        # Menu avancé (inclut maintenant Messages)
         return {
             "inline_keyboard": [
                 [{"text": "📊 Moyennes", "callback_data": "btn_moyennes"}, {"text": "📈 Graphique", "callback_data": "btn_graphique"}],
@@ -425,8 +423,14 @@ class PronoteBot:
                     jour_fr = JOURS_FR[menu.date.weekday()]
                     msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
                     if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
+                    
+                    # Gestion intelligente des repas (str ou dict)
                     if hasattr(menu, 'meals') and menu.meals:
-                        for meal in menu.meals: msg += f"  • {meal}\n"
+                        for meal in menu.meals:
+                            if isinstance(meal, dict):
+                                msg += f"  • {meal.get('libelle', meal.get('name', str(meal)))}\n"
+                            else:
+                                msg += f"  • {meal}\n"
                         has_content = True
                     elif hasattr(menu, 'name') and menu.name: has_content = True
                     msg += "\n"
@@ -573,13 +577,9 @@ class PronoteBot:
             self._telegram("🚀 *Bot réactivé !*", keyboard=self._get_main_keyboard())
             return
 
-        # --- SUPPRESSION DE L'ANTI-SPAM ---
-
         try:
             if text in ['/menu', 'menu', '➕ plus d\'options']:
-                # On affiche d'abord le clavier persistant
                 self._telegram("👋 Voici le menu principal :", keyboard=self._get_main_keyboard())
-                # Puis le menu avancé
                 msg = "🛠️ *Menu Avancé*"
                 payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "reply_markup": self._get_inline_menu()}
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=15)
@@ -668,10 +668,28 @@ class PronoteBot:
                         if hasattr(menu, 'date') and menu.date:
                             msg += f"*{JOURS_FR[menu.date.weekday()]} {menu.date.strftime('%d/%m')}*\n"
                             if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
+                            
                             if hasattr(menu, 'meals') and menu.meals:
-                                for meal in menu.meals: msg += f"  • {meal}\n"
+                                for meal in menu.meals:
+                                    if isinstance(meal, dict):
+                                        msg += f"  • {meal.get('libelle', meal.get('name', str(meal)))}\n"
+                                    else:
+                                        msg += f"  • {meal}\n"
                             msg += "\n"
                     self._telegram(msg)
+
+            elif text == '/debug_menu':
+                self._telegram("⏳ _Analyse des données brutes..._")
+                self._refresh_session()
+                today = date.today()
+                next_monday = today + timedelta(days=(7 - today.weekday()))
+                menus = self.client.menus(next_monday, next_monday + timedelta(days=6))
+                if not menus:
+                    self._telegram("Aucun menu à analyser.")
+                else:
+                    for m in menus:
+                        debug_msg = f"Date: {m.date}\nNom: {m.name}\nRepas brut: `{str(m.meals)}`\n"
+                        self._telegram(debug_msg)
 
             elif text == '/moyennes':
                 self._telegram("⏳ _Calcul des moyennes..._")
