@@ -5,6 +5,7 @@ import threading
 import time
 import io
 import re
+import random
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
@@ -34,8 +35,9 @@ TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 GIST_ID            = os.environ.get("GIST_ID")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN")
 
-# Configuration du proxy (Webshare)
-PROXY_URL          = os.environ.get("PROXY_URL")
+# Rotation des proxies (séparés par des virgules)
+PROXIES_RAW        = os.environ.get("WEBSHARE_PROXIES", "")
+PROXIES_LIST       = [p.strip() for p in PROXIES_RAW.split(",") if p.strip()]
 
 CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "30")) 
 
@@ -49,6 +51,7 @@ class PronoteBot:
         self.client = None
         self.last_update_id = 0
         self.last_command_time = 0
+        self.is_paused = False
 
     # --- FONCTION DE NETTOYAGE ULTIME ---
     def _parse_creds_robust(self, text):
@@ -95,60 +98,58 @@ class PronoteBot:
         files = {filename: {"content": json.dumps(data)}}
         self._gist_request("PATCH", {"files": files})
 
-    # --- CONNEXION ---
+    # --- CONNEXION SÉCURISÉE ---
     def connect(self):
-        log.info("Connexion à Pronote via Token QR Code…")
+        log.info("Connexion à Pronote (Sécurisée)…")
         
-        # --- CONFIGURATION DU PROXY WEBSHARE ---
         proxy_session = None
-        if PROXY_URL:
+        if PROXIES_LIST:
             try:
+                proxy_url = random.choice(PROXIES_LIST)
                 proxy_session = requests.Session()
                 proxy_session.trust_env = False
-                proxy_session.proxies.update({
-                    "http": PROXY_URL,
-                    "https": PROXY_URL
-                })
-                log.info("✅ Session proxy Webshare configurée.")
+                proxy_session.proxies.update({"http": proxy_url, "https": proxy_url})
+                log.info(f"✅ Session proxy configurée (masquée).")
+                time.sleep(random.uniform(1.5, 3.5)) # Délai aléatoire anti-spam
             except Exception as e:
-                log.error("❌ Impossible de configurer le proxy Webshare : %s", e)
-        else:
-            log.warning("⚠️ Aucun PROXY_URL défini. Connexion directe.")
+                log.error("❌ Erreur proxy : %s", e)
+
+        # Chargement des paramètres (Pause)
+        settings = self._load_gist_file("settings.json", {"paused": False})
+        self.is_paused = settings.get("paused", False)
 
         creds = self._load_gist_file("creds.json")
         if creds:
             log.info("Token récupéré depuis le Gist.")
         else:
             if not PRONOTE_CREDS_JSON: 
-                raise ValueError("Le Gist est vide et PRONOTE_CREDS_JSON est manquant sur Render.")
-            log.info("Nettoyage automatique du JSON depuis Render...")
+                raise ValueError("PRONOTE_CREDS_JSON manquant.")
+            log.info("Nettoyage automatique du JSON...")
             creds = self._parse_creds_robust(PRONOTE_CREDS_JSON)
             if not creds:
-                log.error("❌ Impossible de trouver les informations dans le JSON.")
-                self._telegram("❌ *Erreur de token* : Le texte collé dans Render est illisible.")
                 raise ValueError("JSON illisible.")
-            log.info("Utilisation du token initial (Render).")
+            log.info("Utilisation du token initial.")
 
-        # Connexion
         self.client = pronotepy.Client.token_login(**creds)
         
-        # --- INJECTION DE LA SESSION PROXY ---
         if proxy_session:
             self.client.communication.session = proxy_session
-            log.info("✅ Session proxy injectée dans pronotepy.")
-        # -------------------------------------
+            log.info("✅ Session injectée dans pronotepy.")
 
         if not self.client.logged_in: 
-            raise RuntimeError("Token invalide ou IP bloquée (Erreur 23)")
+            raise RuntimeError("Token invalide ou Erreur 23")
         
         log.info("Connecté avec succès !")
         new_creds = self.client.export_credentials()
         self._save_gist_file("creds.json", new_creds)
 
     def _refresh_session(self):
-        if self.client is None or not self.client.logged_in: self.connect()
+        if self.client is None or not self.client.logged_in: 
+            self.connect()
         else:
-            try: self.client.session_check()
+            try: 
+                time.sleep(random.uniform(0.5, 1.5))
+                self.client.session_check()
             except Exception as e:
                 log.warning("Session expirée, reconnexion… : %s", e)
                 self.client = None
@@ -178,22 +179,12 @@ class PronoteBot:
             requests.post(url, data=data, files=files, timeout=30)
         except Exception as e: log.error("Erreur envoi document : %s", e)
 
-    def _set_telegram_commands(self):
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
-        commands = [
-            {"command": "menu", "description": "Afficher le clavier principal"},
-            {"command": "notes", "description": "Voir les 5 dernières notes"},
-            {"command": "devoirs", "description": "Devoirs pour demain"},
-            {"command": "emploi", "description": "Emploi du temps de la semaine"},
-            {"command": "graphique", "description": "Voir l'évolution de la moyenne"}
-        ]
-        requests.post(url, json={"commands": commands})
-
     def _get_main_keyboard(self):
         return {
             "keyboard": [
                 [{"text": "📝 Dernières notes"}, {"text": "📚 Devoirs pour demain"}],
-                [{"text": "📅 Emploi du temps"}, {"text": "📈 Graphique"}]
+                [{"text": "📅 Emploi du temps"}, {"text": "📈 Graphique"}],
+                [{"text": "⏸️ Mettre en pause"}, {"text": "▶️ Reprendre"}]
             ],
             "resize_keyboard": True,
             "is_persistent": True
@@ -220,8 +211,41 @@ class PronoteBot:
         last_sent[task_name] = date_str
         self._save_gist_file("last_sent.json", last_sent)
 
+    # --- NOUVEAU : FICHIERS DES COURS ---
+    def check_lesson_files(self):
+        if self.is_paused: return
+        try:
+            self._refresh_session()
+            seen_files = set(self._load_gist_file("seen_files.json", []))
+            if not isinstance(seen_files, set): seen_files = set()
+            new_count = 0
+            
+            today = date.today()
+            lessons = self.client.lessons(today - timedelta(days=1), today + timedelta(days=1))
+            
+            for lesson in lessons:
+                if hasattr(lesson, 'content') and lesson.content:
+                    for item in lesson.content:
+                        if getattr(item, 'type', 0) == 1:
+                            fid = f"{lesson.subject.name}|{item.name}"
+                            if fid not in seen_files:
+                                try:
+                                    file_data = item.data
+                                    self._telegram_document(file_data, item.name, caption=f"📄 Nouveau document : *{lesson.subject.name}*")
+                                    seen_files.add(fid)
+                                    new_count += 1
+                                except Exception as e:
+                                    log.error("Erreur téléchargement fichier : %s", e)
+            
+            if new_count:
+                self._save_gist_file("seen_files.json", list(seen_files))
+                log.info(f"{new_count} nouveau(x) fichier(s) envoyé(s).")
+        except Exception as e: 
+            log.error("Erreur check_lesson_files : %s", e)
+
     # --- TÂCHES AUTOMATIQUES ---
     def check_grades(self):
+        if self.is_paused: return
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_grades.json", []))
@@ -241,6 +265,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur check_grades : %s", e)
 
     def check_lesson_changes(self):
+        if self.is_paused: return
         try:
             self._refresh_session()
             old_lessons = self._load_gist_file("seen_lessons.json", {})
@@ -267,6 +292,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur check_lesson_changes : %s", e)
 
     def check_informations(self):
+        if self.is_paused: return
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_infos.json", []))
@@ -288,6 +314,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur check_informations : %s", e)
 
     def check_discussions(self):
+        if self.is_paused: return
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_disc.json", []))
@@ -307,6 +334,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur check_discussions : %s", e)
 
     def check_absences(self):
+        if self.is_paused: return
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_abs.json", []))
@@ -324,6 +352,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur check_absences : %s", e)
 
     def check_punishments(self):
+        if self.is_paused: return
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_punishments.json", []))
@@ -341,6 +370,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur check_punishments : %s", e)
 
     def check_skills(self):
+        if self.is_paused: return
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_skills.json", []))
@@ -360,6 +390,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur check_skills : %s", e)
 
     def check_homework_and_timetable_daily(self):
+        if self.is_paused: return
         today_str = date.today().strftime("%Y-%m-%d")
         if self._check_already_sent("devoirs_edt", today_str): return
         try:
@@ -399,6 +430,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur devoirs/edt : %s", e)
 
     def check_menus(self):
+        if self.is_paused: return
         today_str = date.today().strftime("%Y-%m-%d")
         if self._check_already_sent("menus", today_str): return
         try:
@@ -427,6 +459,7 @@ class PronoteBot:
         except Exception as e: log.error("Erreur menus : %s", e)
 
     def send_weekly_summary(self):
+        if self.is_paused: return
         today_str = date.today().strftime("%Y-%m-%d")
         if self._check_already_sent("bilan", today_str): return
         try:
@@ -501,7 +534,7 @@ class PronoteBot:
         except Exception as e:
             log.error("Erreur graphique : %s", e)
 
-    # --- POLLING ET COMMANDES TELEGRAM ---
+    # --- COMMANDES TELEGRAM ---
     def _poll_telegram(self):
         requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
         log.info("Écoute des messages Telegram en cours...")
@@ -521,13 +554,12 @@ class PronoteBot:
                     for update in updates:
                         self.last_update_id = update['update_id']
                         if 'message' in update and 'text' in update['message']:
-                            log.info(f"💬 Commande reçue : {update['message']['text']}")
                             self._handle_command(update['message']['text'])
                 elif r.status_code == 409:
-                    log.warning("⚠️ Conflit Telegram (409) : Une autre instance du bot tourne encore. Attente...")
+                    log.warning("⚠️ Conflit Telegram (409). Attente...")
                     time.sleep(10)
                 else:
-                    log.error(f"Erreur Telegram API ({r.status_code}) : {r.text}")
+                    log.error(f"Erreur Telegram API ({r.status_code})")
                     
             except Exception as e:
                 log.error("Erreur polling Telegram : %s", e)
@@ -536,19 +568,31 @@ class PronoteBot:
     def _handle_command(self, text):
         text = text.lower().strip()
         
-        if time.time() - self.last_command_time < 10 and text not in ['/start', '/menu', 'menu']:
-            self._telegram("⏳ _Doucement ! Attends 10 secondes entre chaque commande._")
+        if text in ['/stop', '⏸️ mettre en pause']:
+            self.is_paused = True
+            self._save_gist_file("settings.json", {"paused": True})
+            self._telegram("💤 *Mode Pause activé.* Le bot ne vérifiera plus Pronote jusqu'à nouvel ordre. Idéal pour les vacances !")
+            return
+            
+        elif text in ['/start', '▶️ reprendre']:
+            self.is_paused = False
+            self._save_gist_file("settings.json", {"paused": False})
+            self._telegram("🚀 *Bot réactivé !* Je recommence à surveiller Pronote.", keyboard=self._get_main_keyboard())
+            return
+
+        if time.time() - self.last_command_time < 10 and text not in ['/menu']:
+            self._telegram("⏳ _Doucement ! Attends 10 secondes._")
             return
             
         self.last_command_time = time.time()
 
         try:
-            if text in ['/start', '/menu', 'menu']:
-                welcome = "👋 *Bienvenue !*\nChoisis une option."
+            if text in ['/menu', 'menu']:
+                welcome = "👋 *Menu Principal*\nChoisis une option ou tape /stop pour mettre en pause."
                 self._telegram(welcome, keyboard=self._get_main_keyboard())
                 
             elif text in ['/notes', '📝 dernières notes']:
-                self._telegram("⏳ _Recherche de tes notes en cours..._")
+                self._telegram("⏳ _Recherche en cours..._")
                 self._refresh_session()
                 msg = "*📝 Tes 5 dernières notes*\n\n"
                 count = 0
@@ -562,7 +606,7 @@ class PronoteBot:
                 self._telegram(msg if count > 0 else "Aucune note trouvée.")
                 
             elif text in ['/devoirs', '📚 devoirs pour demain']:
-                self._telegram("⏳ _Recherche des devoirs en cours..._")
+                self._telegram("⏳ _Recherche en cours..._")
                 self._refresh_session()
                 tomorrow = date.today() + timedelta(days=1)
                 homeworks = self.client.homework(tomorrow, tomorrow)
@@ -573,10 +617,10 @@ class PronoteBot:
                         msg += f"• *{hw.subject.name}* : {hw.description[:100]}\n"
                     self._telegram(msg)
                 else:
-                    self._telegram("✅ Aucun devoir non fait pour demain !")
+                    self._telegram("✅ Aucun devoir non fait !")
                     
             elif text in ['/emploi', '📅 emploi du temps']:
-                self._telegram("⏳ _Recherche de l'emploi du temps..._")
+                self._telegram("⏳ _Recherche en cours..._")
                 self._refresh_session()
                 today = date.today()
                 msg = "*📅 Emploi du temps de la semaine*\n\n"
@@ -594,13 +638,13 @@ class PronoteBot:
                 self._telegram(msg if has_lessons else "Aucun cours cette semaine.")
                 
             elif text in ['/graphique', '📈 graphique']:
-                self._telegram("⏳ _Génération du graphique en cours..._")
+                self._telegram("⏳ _Génération en cours..._")
                 self._refresh_session()
                 self._generate_grade_chart()
                 
         except Exception as e:
             log.error(f"Erreur commande {text} : {e}")
-            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nRéessaie plus tard.")
+            self._telegram(f"❌ *Erreur :*\n`{str(e)}`")
 
 # ---------------------------------------------------------------------------
 # LANCEMENT
@@ -610,7 +654,7 @@ bot = PronoteBot()
 
 @app.route("/")
 def health():
-    return jsonify(status="ok", connected=bot.client is not None and bot.client.logged_in), 200
+    return jsonify(status="ok", connected=bot.client is not None and bot.client.logged_in, paused=bot.is_paused), 200
 
 @app.route("/check")
 def manual_check():
@@ -624,7 +668,6 @@ def manual_check():
 def scheduler_loop():
     try:
         bot.connect()
-        bot._set_telegram_commands()
     except Exception as e:
         log.warning("Connexion initiale échouée : %s", e)
 
@@ -636,6 +679,7 @@ def scheduler_loop():
     scheduler.add_job(bot.check_absences, "interval", minutes=CHECK_INTERVAL)
     scheduler.add_job(bot.check_punishments, "interval", minutes=CHECK_INTERVAL)
     scheduler.add_job(bot.check_skills, "interval", minutes=CHECK_INTERVAL)
+    scheduler.add_job(bot.check_lesson_files, "interval", minutes=CHECK_INTERVAL)
     
     scheduler.add_job(bot.check_menus, CronTrigger(day_of_week='sun', hour=18, minute=0))
     scheduler.add_job(bot.check_homework_and_timetable_daily, CronTrigger(hour=19, minute=30))
