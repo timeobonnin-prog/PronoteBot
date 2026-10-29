@@ -4,7 +4,7 @@ import logging
 import threading
 import time
 import io
-import re  # <-- NOUVEL IMPORT POUR LE NETTOYAGE
+import re
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
@@ -50,11 +50,8 @@ class PronoteBot:
 
     # --- FONCTION DE NETTOYAGE ULTIME ---
     def _parse_creds_robust(self, text):
-        """Extrait les identifiants avec des regex, immunisé contre les sauts de ligne et virgules manquantes."""
         if not text: return None
         creds = {}
-        
-        # Recherche des valeurs peu importe la mise en forme
         match_url = re.search(r'"pronote_url"\s*:\s*"([^"]+)"', text)
         match_user = re.search(r'"username"\s*:\s*"([^"]+)"', text)
         match_pass = re.search(r'"password"\s*:\s*"([^"]+)"', text)
@@ -67,7 +64,6 @@ class PronoteBot:
         if match_client: creds["client_identifier"] = match_client.group(1)
         if match_uuid: creds["uuid"] = match_uuid.group(1)
 
-        # On vérifie qu'on a bien les infos vitales
         if "password" in creds and "client_identifier" in creds:
             return creds
         return None
@@ -89,9 +85,7 @@ class PronoteBot:
         if gist and "files" in gist and filename in gist["files"]:
             content = gist["files"][filename]["content"]
             if not content or content.strip() == "": return default
-            try: 
-                # On utilise aussi le parseur robuste pour le Gist !
-                return self._parse_creds_robust(content) or json.loads(content)
+            try: return self._parse_creds_robust(content) or json.loads(content)
             except: return default
         return default
 
@@ -103,34 +97,34 @@ class PronoteBot:
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
         
-        # --- CONFIGURATION DU PROXY IPLOOP ---
+        # --- CONFIGURATION DU PROXY IPLOOP (Méthode standard requests) ---
         proxy_session = None
         if IPLOOP_API_KEY:
             try:
-                from iploop import IPLoop
-                ip_client = IPLoop(api_key=IPLOOP_API_KEY, country="FR")
-                proxy_session = ip_client.session()
-                log.info("✅ Session IPLoop récupérée avec succès.")
+                # On utilise le format avec ciblage France
+                proxy_url = f"http://{IPLOOP_API_KEY}-country-FR@proxy.iploop.io:8880"
+                
+                proxy_session = requests.Session()
+                proxy_session.proxies.update({
+                    "http": proxy_url,
+                    "https": proxy_url
+                })
+                log.info("✅ Session proxy IPLoop (standard) configurée.")
             except Exception as e:
-                log.error("❌ Impossible de configurer IPLoop : %s", e)
+                log.error("❌ Impossible de configurer le proxy IPLoop : %s", e)
 
-        # 1. On cherche dans le Gist
         creds = self._load_gist_file("creds.json")
         if creds:
             log.info("Token récupéré depuis le Gist.")
         else:
-            # 2. Sinon on utilise Render avec le nettoyage robuste
             if not PRONOTE_CREDS_JSON: 
                 raise ValueError("Le Gist est vide et PRONOTE_CREDS_JSON est manquant sur Render.")
-            
             log.info("Nettoyage automatique du JSON depuis Render...")
             creds = self._parse_creds_robust(PRONOTE_CREDS_JSON)
-            
             if not creds:
                 log.error("❌ Impossible de trouver les informations dans le JSON.")
-                self._telegram("❌ *Erreur de token* : Le texte collé dans Render est illisible, même après nettoyage. Vérifie qu'il contient bien 'password' et 'client_identifier'.")
+                self._telegram("❌ *Erreur de token* : Le texte collé dans Render est illisible.")
                 raise ValueError("JSON illisible.")
-                
             log.info("Utilisation du token initial (Render).")
 
         # Connexion
@@ -139,7 +133,7 @@ class PronoteBot:
         # --- INJECTION DE LA SESSION PROXY ---
         if proxy_session:
             self.client.communication.session = proxy_session
-            log.info("✅ Session IPLoop injectée dans pronotepy.")
+            log.info("✅ Session proxy injectée dans pronotepy.")
         # -------------------------------------
 
         if not self.client.logged_in: 
@@ -541,7 +535,7 @@ class PronoteBot:
         text = text.lower().strip()
         
         if time.time() - self.last_command_time < 10 and text not in ['/start', '/menu', 'menu']:
-            self._telegram("⏳ _Doucement ! Attends 10 secondes entre chaque commande pour ne pas faire bannir le serveur par Pronote._")
+            self._telegram("⏳ _Doucement ! Attends 10 secondes entre chaque commande._")
             return
             
         self.last_command_time = time.time()
@@ -604,7 +598,7 @@ class PronoteBot:
                 
         except Exception as e:
             log.error(f"Erreur commande {text} : {e}")
-            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nL'IP est sûrement bloquée (Erreur 23) ou le proxy a échoué. Réessaie plus tard.")
+            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nRéessaie plus tard.")
 
 # ---------------------------------------------------------------------------
 # LANCEMENT
