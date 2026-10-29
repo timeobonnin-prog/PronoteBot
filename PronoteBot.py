@@ -303,11 +303,12 @@ class PronoteBot:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_disc.json", []))
             new_count = 0
-            # CORRECTION ICI : self.client.messages() -> self.client.discussions()
             discussions = self.client.discussions()
             for disc in discussions:
                 for msg in disc.messages:
-                    if not msg.read:
+                    # Utilisation de getattr pour éviter le crash si l'attribut n'existe pas
+                    is_read = getattr(msg, 'read', True)
+                    if not is_read:
                         mid = f"{disc.id}|{msg.id}"
                         if mid not in seen:
                             txt = f"*💬 Nouveau message – {msg.author}*\n📌 {disc.subject}\n📝 {msg.content[:150]}..."
@@ -425,12 +426,16 @@ class PronoteBot:
                     msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
                     if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
                     
+                    # Extraction robuste des repas
                     if hasattr(menu, 'meals') and menu.meals:
                         for meal in menu.meals:
                             if isinstance(meal, dict):
-                                msg += f"  • {meal.get('libelle', meal.get('name', str(meal)))}\n"
-                            else:
+                                meal_name = meal.get('nom', meal.get('libelle', meal.get('name', '')))
+                                if meal_name: msg += f"  • {meal_name}\n"
+                            elif isinstance(meal, str):
                                 msg += f"  • {meal}\n"
+                            else:
+                                msg += f"  • {str(meal)}\n"
                         has_content = True
                     elif hasattr(menu, 'name') and menu.name: has_content = True
                     msg += "\n"
@@ -672,9 +677,12 @@ class PronoteBot:
                             if hasattr(menu, 'meals') and menu.meals:
                                 for meal in menu.meals:
                                     if isinstance(meal, dict):
-                                        msg += f"  • {meal.get('libelle', meal.get('name', str(meal)))}\n"
-                                    else:
+                                        meal_name = meal.get('nom', meal.get('libelle', meal.get('name', '')))
+                                        if meal_name: msg += f"  • {meal_name}\n"
+                                    elif isinstance(meal, str):
                                         msg += f"  • {meal}\n"
+                                    else:
+                                        msg += f"  • {str(meal)}\n"
                             msg += "\n"
                     self._telegram(msg)
 
@@ -697,18 +705,21 @@ class PronoteBot:
                 msg = "*📊 Tes moyennes*\n\n"
                 try:
                     current_period = self.client.current_period
+                    overall = getattr(current_period, 'overall_average', '—')
                     try:
-                        overall = float(str(current_period.overall_average).replace(',', '.'))
-                        msg += f"🎯 *Générale* : {overall:.2f}/20\n\n"
+                        msg += f"🎯 *Générale* : {float(str(overall).replace(',', '.')):.2f}/20\n\n"
                     except:
-                        msg += f"🎯 *Générale* : {current_period.overall_average}/20\n\n"
+                        msg += f"🎯 *Générale* : {overall}/20\n\n"
 
-                    for subject, avg in current_period.averages.items():
+                    # CORRECTION ICI : c'est une liste d'objets, pas un dictionnaire
+                    for avg in current_period.averages:
+                        subject_name = getattr(avg.subject, 'name', 'Matière inconnue') if hasattr(avg, 'subject') else 'Matière'
+                        val = getattr(avg, 'average', '—')
                         try:
-                            avg_float = float(str(avg).replace(',', '.'))
-                            msg += f"• {subject} : {avg_float:.2f}\n"
+                            val_float = float(str(val).replace(',', '.'))
+                            msg += f"• {subject_name} : {val_float:.2f}\n"
                         except:
-                            msg += f"• {subject} : {avg}\n"
+                            msg += f"• {subject_name} : {val}\n"
                     self._telegram(msg)
                 except Exception as e:
                     self._telegram(f"❌ Erreur : {str(e)}")
@@ -761,14 +772,16 @@ class PronoteBot:
             elif text in ['/messages', '💬 messages']:
                 self._telegram("⏳ _Recherche des messages..._")
                 self._refresh_session()
-                # CORRECTION ICI : self.client.messages() -> self.client.discussions()
                 discussions = self.client.discussions()
                 msg = "*💬 Tes derniers messages*\n\n"
                 count = 0
                 for disc in discussions:
                     for m in disc.messages:
                         if count >= 5: break
-                        statut = "🟢" if not m.read else "⚪"
+                        
+                        # CORRECTION ICI : getattr pour éviter l'erreur 'read'
+                        is_read = getattr(m, 'read', True)
+                        statut = "🟢" if not is_read else "⚪"
                         msg += f"{statut} *{m.author}* ({m.date.strftime('%d/%m')}) :\n{disc.subject} - {m.content[:80]}...\n\n"
                         count += 1
                     if count >= 5: break
