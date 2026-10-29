@@ -186,7 +186,7 @@ class PronoteBot:
             log.info("Mise à jour du cache en cours...")
             cache = {}
 
-            # 1. Notes et Moyennes (Correction ici)
+            # 1. Notes et Moyennes
             cache["grades"] = []
             cache["averages"] = {}
             try:
@@ -195,15 +195,16 @@ class PronoteBot:
                 try: cache["averages"]["general"] = round(float(str(overall).replace(',', '.')), 2)
                 except: cache["averages"]["general"] = str(overall)
                 
-                # Extraction des moyennes par matière
                 for avg_obj in period.averages:
                     subj = avg_obj.subject.name if hasattr(avg_obj, 'subject') else 'Matière'
-                    # On lit directement la propriété .average de l'objet
-                    try:
-                        val = avg_obj.average
-                        cache["averages"][subj] = round(float(str(val).replace(',', '.')), 2)
-                    except Exception:
-                        cache["averages"][subj] = "—"
+                    
+                    # ON CHERCHE LA MOYENNE DANS TOUS LES ATTRIBUTS POSSIBLES
+                    val = getattr(avg_obj, 'student_average', None)
+                    if val is None: val = getattr(avg_obj, 'average', None)
+                    if val is None: val = getattr(avg_obj, 'value', '—')
+                    
+                    try: cache["averages"][subj] = round(float(str(val).replace(',', '.')), 2)
+                    except: cache["averages"][subj] = str(val)
 
                 for g in period.grades:
                     cache["grades"].append({
@@ -275,7 +276,7 @@ class PronoteBot:
                     })
             except Exception as e: log.error("Erreur cache infos : %s", e)
 
-            # 6. Cantine (Correction pour extraire les plats)
+            # 6. Cantine (Recherche ultra-robuste des plats)
             cache["menus"] = []
             try:
                 next_monday = today + timedelta(days=(7 - today.weekday()))
@@ -285,11 +286,23 @@ class PronoteBot:
                         meals = []
                         if hasattr(m, 'meals') and m.meals:
                             for meal in m.meals:
+                                # Si c'est un dictionnaire (très fréquent)
                                 if isinstance(meal, dict):
-                                    name = meal.get('libelle') or meal.get('nom') or meal.get('name')
-                                    if name: meals.append(name)
-                                elif isinstance(meal, str):
-                                    meals.append(meal)
+                                    for key, val in meal.items():
+                                        if key in ['libelle', 'nom', 'name', 'label'] and val:
+                                            meals.append(str(val))
+                                        elif isinstance(val, str) and val not in meals:
+                                            meals.append(val)
+                                # Si c'est un objet avec un attribut name
+                                elif hasattr(meal, 'name'):
+                                    meals.append(str(meal.name))
+                                # Si c'est juste du texte
+                                else:
+                                    meals.append(str(meal))
+                        
+                        # On nettoie les doublons éventuels
+                        meals = list(dict.fromkeys(meals))
+
                         cache["menus"].append({
                             "date": f"{JOURS_FR[m.date.weekday()]} {m.date.strftime('%d/%m')}",
                             "name": getattr(m, 'name', ''),
@@ -473,6 +486,23 @@ class PronoteBot:
                 buf.seek(0)
                 plt.close()
                 self._telegram_photo(buf, caption="📈 *Ton évolution (depuis le cache)*")
+                
+            elif text == '/debug':
+                self._telegram("⏳ _Génération du rapport de debug..._")
+                # On force une connexion pour lire les données brutes
+                self._refresh_session()
+                try:
+                    period = self.client.current_period
+                    raw_avg = str(vars(period.averages[0])) if period.averages else "Aucune moyenne"
+                    
+                    today = date.today()
+                    next_monday = today + timedelta(days=(7 - today.weekday()))
+                    menus = self.client.menus(next_monday, next_monday + timedelta(days=1))
+                    raw_menu = str(vars(menus[0])) if menus else "Aucun menu"
+                    
+                    self._telegram(f"*Debug Averages :*\n`{raw_avg[:400]}`\n\n*Debug Menus :*\n`{raw_menu[:400]}`")
+                except Exception as e:
+                    self._telegram(f"❌ Erreur debug : {e}")
                 
         except Exception as e:
             log.error(f"Erreur commande cache {text} : {e}")
