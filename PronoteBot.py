@@ -36,7 +36,6 @@ GIST_ID            = os.environ.get("GIST_ID")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN")
 PROXIES_RAW        = os.environ.get("WEBSHARE_PROXIES", "")
 PROXIES_LIST       = [p.strip() for p in PROXIES_RAW.split(",") if p.strip()]
-CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "30")) 
 
 JOURS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 COULEURS_COMPETENCES = {
@@ -306,7 +305,6 @@ class PronoteBot:
             discussions = self.client.discussions()
             for disc in discussions:
                 for msg in disc.messages:
-                    # Utilisation de getattr pour éviter le crash si l'attribut n'existe pas
                     is_read = getattr(msg, 'read', True)
                     if not is_read:
                         mid = f"{disc.id}|{msg.id}"
@@ -426,7 +424,6 @@ class PronoteBot:
                     msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
                     if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
                     
-                    # Extraction robuste des repas
                     if hasattr(menu, 'meals') and menu.meals:
                         for meal in menu.meals:
                             if isinstance(meal, dict):
@@ -711,7 +708,6 @@ class PronoteBot:
                     except:
                         msg += f"🎯 *Générale* : {overall}/20\n\n"
 
-                    # CORRECTION ICI : c'est une liste d'objets, pas un dictionnaire
                     for avg in current_period.averages:
                         subject_name = getattr(avg.subject, 'name', 'Matière inconnue') if hasattr(avg, 'subject') else 'Matière'
                         val = getattr(avg, 'average', '—')
@@ -778,8 +774,6 @@ class PronoteBot:
                 for disc in discussions:
                     for m in disc.messages:
                         if count >= 5: break
-                        
-                        # CORRECTION ICI : getattr pour éviter l'erreur 'read'
                         is_read = getattr(m, 'read', True)
                         statut = "🟢" if not is_read else "⚪"
                         msg += f"{statut} *{m.author}* ({m.date.strftime('%d/%m')}) :\n{disc.subject} - {m.content[:80]}...\n\n"
@@ -817,21 +811,28 @@ def scheduler_loop():
         log.warning("Connexion initiale échouée : %s", e)
 
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
-    scheduler.add_job(bot.check_grades, "interval", minutes=CHECK_INTERVAL, next_run_time=datetime.now())
-    scheduler.add_job(bot.check_lesson_changes, "interval", minutes=CHECK_INTERVAL)
-    scheduler.add_job(bot.check_informations, "interval", minutes=CHECK_INTERVAL)
-    scheduler.add_job(bot.check_discussions, "interval", minutes=CHECK_INTERVAL)
-    scheduler.add_job(bot.check_absences, "interval", minutes=CHECK_INTERVAL)
-    scheduler.add_job(bot.check_punishments, "interval", minutes=CHECK_INTERVAL)
-    scheduler.add_job(bot.check_skills, "interval", minutes=CHECK_INTERVAL)
-    scheduler.add_job(bot.check_lesson_files, "interval", minutes=CHECK_INTERVAL)
+
+    # --- CONFIGURATION DES HORAIRES (9h00, 12h00, 14h30, 19h30) ---
+    # On ajoute 1 à 7 minutes de décalage pour ne pas spammer Pronote avec 10 requêtes à la même seconde.
+    heures = [(9, 0), (12, 0), (14, 30), (19, 30)]
     
+    for h, m in heures:
+        scheduler.add_job(bot.check_grades, CronTrigger(hour=h, minute=m))
+        scheduler.add_job(bot.check_informations, CronTrigger(hour=h, minute=m+1))
+        scheduler.add_job(bot.check_discussions, CronTrigger(hour=h, minute=m+2))
+        scheduler.add_job(bot.check_absences, CronTrigger(hour=h, minute=m+3))
+        scheduler.add_job(bot.check_punishments, CronTrigger(hour=h, minute=m+4))
+        scheduler.add_job(bot.check_skills, CronTrigger(hour=h, minute=m+5))
+        scheduler.add_job(bot.check_lesson_files, CronTrigger(hour=h, minute=m+6))
+        scheduler.add_job(bot.check_lesson_changes, CronTrigger(hour=h, minute=m+7))
+
+    # Planifications spécifiques
+    scheduler.add_job(bot.check_homework_and_timetable_daily, CronTrigger(hour=19, minute=38)) # Décalé après les autres
     scheduler.add_job(bot.check_menus, CronTrigger(day_of_week='sun', hour=18, minute=0))
-    scheduler.add_job(bot.check_homework_and_timetable_daily, CronTrigger(hour=19, minute=30))
-    scheduler.add_job(bot.send_weekly_summary, CronTrigger(day_of_week='sun', hour=19, minute=5))
-    
+    scheduler.add_job(bot.send_weekly_summary, CronTrigger(day_of_week='sun', hour=19, minute=45))
+
     scheduler.start()
-    log.info("Planificateur démarré.")
+    log.info("Planificateur démarré avec les horaires personnalisés.")
 
     threading.Thread(target=bot._poll_telegram, daemon=True).start()
 
