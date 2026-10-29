@@ -94,11 +94,14 @@ class PronoteBot:
             if not PRONOTE_CREDS_JSON: 
                 raise ValueError("Le Gist est vide et PRONOTE_CREDS_JSON est manquant sur Render.")
             try:
-                creds = json.loads(PRONOTE_CREDS_JSON)
+                # --- NETTOYAGE AUTOMATIQUE DU JSON ---
+                # On enlève les sauts de ligne et les espaces inutiles qui cassent le JSON
+                clean_json = PRONOTE_CREDS_JSON.strip().replace("\n", "").replace("\r", "")
+                creds = json.loads(clean_json)
                 log.info("Utilisation du token initial (Render).")
             except json.JSONDecodeError as e:
                 log.error("❌ Le PRONOTE_CREDS_JSON est mal formaté : %s", e)
-                self._telegram("❌ *Erreur de token* : Le JSON dans Render est mal formaté (vérifie les virgules et les sauts de ligne).")
+                self._telegram("❌ *Erreur de token* : Le JSON dans Render est mal formaté. Vérifie qu'il est bien complet et sans caractères bizarres.")
                 raise
 
         # Connexion
