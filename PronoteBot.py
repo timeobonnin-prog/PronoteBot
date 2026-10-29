@@ -7,29 +7,51 @@ import io
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
-import pronotepy
 import requests
+
+# ---------------------------------------------------------------------------
+# 🛡️ CONFIGURATION GLOBALE D'IPLOOP (PROXY)
+# Doit être fait AVANT l'import de pronotepy pour intercepter toutes les requêtes
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("pronotebot")
+
+IPLOOP_API_KEY = os.environ.get("IPLOOP_API_KEY")
+
+if IPLOOP_API_KEY:
+    try:
+        from iploop import IPLoop
+        # Initialise le client IPLoop (ciblé France)
+        ip_client = IPLoop(api_key=IPLOOP_API_KEY, country="FR")
+        # Récupère la configuration du proxy
+        temp_session = ip_client.session()
+        proxy_config = temp_session.proxies
+        
+        # Patch global : on modifie la classe requests.Session pour qu'elle utilise le proxy
+        original_session_init = requests.Session.__init__
+        def patched_session_init(self, *args, **kwargs):
+            original_session_init(self, *args, **kwargs)
+            self.proxies.update(proxy_config)
+        
+        requests.Session.__init__ = patched_session_init
+        log.info("✅ Proxy IPLoop configuré globalement pour toutes les requêtes.")
+    except Exception as e:
+        log.error("❌ Impossible de configurer IPLoop : %s", e)
+else:
+    log.warning("⚠️ Pas de clé IPLoop. Connexion directe (risque de ban).")
+
+# ---------------------------------------------------------------------------
+# IMPORTS (après le patch du proxy)
+# ---------------------------------------------------------------------------
+import pronotepy
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from flask import Flask, jsonify
 
-# Pour le graphique
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-
-# Pour le proxy IPLoop
-try:
-    from iploop import IPLoop
-except ImportError:
-    IPLoop = None
-
-# ---------------------------------------------------------------------------
-# Logs
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("pronotebot")
 
 # ---------------------------------------------------------------------------
 # Variables d'environnement
@@ -39,9 +61,7 @@ TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 GIST_ID            = os.environ.get("GIST_ID")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN")
-IPLOOP_API_KEY     = os.environ.get("IPLOOP_API_KEY") # Nouvelle variable Proxy
-
-CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "30")) # 30 min pour éviter le ban
+CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "30")) 
 
 JOURS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
 COULEURS_COMPETENCES = {
@@ -52,7 +72,7 @@ class PronoteBot:
     def __init__(self):
         self.client = None
         self.last_update_id = 0
-        self.last_command_time = 0 # Anti-spam commandes
+        self.last_command_time = 0
 
     # --- GESTION DU GIST ---
     def _gist_request(self, method, data=None):
@@ -81,20 +101,6 @@ class PronoteBot:
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
         
-        # --- CONFIGURATION DU PROXY IPLOOP ---
-        proxy_session = None
-        if IPLOOP_API_KEY and IPLoop:
-            try:
-                # On crée un client IPLoop avec une IP française
-                ip_client = IPLoop(api_key=IPLOOP_API_KEY, country="FR")
-                # On récupère une session (sticky = garde la même IP le temps de la session)
-                proxy_session = ip_client.session()
-                log.info("✅ Proxy IPLoop configuré avec succès.")
-            except Exception as e:
-                log.error("❌ Impossible de configurer le proxy IPLoop : %s", e)
-        else:
-            log.warning("⚠️ Pas de clé IPLoop ou librairie manquante. Connexion directe (risque de ban).")
-
         creds = self._load_gist_file("creds.json")
         if creds:
             log.info("Token récupéré depuis le Gist.")
@@ -103,25 +109,14 @@ class PronoteBot:
             creds = json.loads(PRONOTE_CREDS_JSON)
             log.info("Utilisation du token initial (Render).")
 
-        # Connexion à Pronote
+        # Connexion (elle utilisera automatiquement le proxy grâce au patch)
         self.client = pronotepy.Client.token_login(**creds)
         
-        # --- INJECTION DE LA SESSION PROXY ---
-        if proxy_session:
-            if hasattr(self.client, 'communication') and hasattr(self.client.communication, 'session'):
-                self.client.communication.session = proxy_session
-                log.info("Session proxy injectée dans pronotepy.communication.session")
-            elif hasattr(self.client, 'session'):
-                self.client.session = proxy_session
-                log.info("Session proxy injectée dans pronotepy.session")
-        # -------------------------------------
-
         if not self.client.logged_in: raise RuntimeError("Token invalide")
         
         log.info("Connecté avec succès !")
         new_creds = self.client.export_credentials()
         self._save_gist_file("creds.json", new_creds)
-        log.info("Nouveau token sauvegardé.")
 
     def _refresh_session(self):
         if self.client is None or not self.client.logged_in: self.connect()
@@ -502,7 +497,6 @@ class PronoteBot:
     def _handle_command(self, text):
         text = text.lower().strip()
         
-        # Anti-spam : 10 secondes entre chaque commande
         if time.time() - self.last_command_time < 10 and text not in ['/start', '/menu', 'menu']:
             self._telegram("⏳ _Doucement ! Attends 10 secondes entre chaque commande pour ne pas faire bannir le serveur par Pronote._")
             return
@@ -567,7 +561,7 @@ class PronoteBot:
                 
         except Exception as e:
             log.error(f"Erreur commande {text} : {e}")
-            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nL'IP est sûrement bloquée, ou le proxy a échoué. Réessaie plus tard.")
+            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nSi c'est l'erreur 23, Pronote a bloqué le compte, il faut attendre un peu. Sinon, réessaie.")
 
 # ---------------------------------------------------------------------------
 # LANCEMENT
