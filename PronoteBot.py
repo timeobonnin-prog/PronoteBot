@@ -8,41 +8,6 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 
 import requests
-
-# ---------------------------------------------------------------------------
-# 🛡️ CONFIGURATION GLOBALE D'IPLOOP (PROXY)
-# Doit être fait AVANT l'import de pronotepy pour intercepter toutes les requêtes
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("pronotebot")
-
-IPLOOP_API_KEY = os.environ.get("IPLOOP_API_KEY")
-
-if IPLOOP_API_KEY:
-    try:
-        from iploop import IPLoop
-        # Initialise le client IPLoop (ciblé France)
-        ip_client = IPLoop(api_key=IPLOOP_API_KEY, country="FR")
-        # Récupère la configuration du proxy
-        temp_session = ip_client.session()
-        proxy_config = temp_session.proxies
-        
-        # Patch global : on modifie la classe requests.Session pour qu'elle utilise le proxy
-        original_session_init = requests.Session.__init__
-        def patched_session_init(self, *args, **kwargs):
-            original_session_init(self, *args, **kwargs)
-            self.proxies.update(proxy_config)
-        
-        requests.Session.__init__ = patched_session_init
-        log.info("✅ Proxy IPLoop configuré globalement pour toutes les requêtes.")
-    except Exception as e:
-        log.error("❌ Impossible de configurer IPLoop : %s", e)
-else:
-    log.warning("⚠️ Pas de clé IPLoop. Connexion directe (risque de ban).")
-
-# ---------------------------------------------------------------------------
-# IMPORTS (après le patch du proxy)
-# ---------------------------------------------------------------------------
 import pronotepy
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -54,6 +19,12 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
 # ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("pronotebot")
+
+# ---------------------------------------------------------------------------
 # Variables d'environnement
 # ---------------------------------------------------------------------------
 PRONOTE_CREDS_JSON = os.environ.get("PRONOTE_CREDS_JSON")
@@ -61,6 +32,8 @@ TELEGRAM_TOKEN     = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID   = os.environ["TELEGRAM_CHAT_ID"]
 GIST_ID            = os.environ.get("GIST_ID")
 GITHUB_TOKEN       = os.environ.get("GITHUB_TOKEN")
+IPLOOP_API_KEY     = os.environ.get("IPLOOP_API_KEY")
+
 CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL_MIN", "30")) 
 
 JOURS_FR = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"]
@@ -101,6 +74,17 @@ class PronoteBot:
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
         
+        # --- CONFIGURATION DU PROXY IPLOOP ---
+        proxy_session = None
+        if IPLOOP_API_KEY:
+            try:
+                from iploop import IPLoop
+                ip_client = IPLoop(api_key=IPLOOP_API_KEY, country="FR")
+                proxy_session = ip_client.session()
+                log.info("✅ Session IPLoop récupérée avec succès.")
+            except Exception as e:
+                log.error("❌ Impossible de configurer IPLoop : %s", e)
+
         creds = self._load_gist_file("creds.json")
         if creds:
             log.info("Token récupéré depuis le Gist.")
@@ -109,10 +93,17 @@ class PronoteBot:
             creds = json.loads(PRONOTE_CREDS_JSON)
             log.info("Utilisation du token initial (Render).")
 
-        # Connexion (elle utilisera automatiquement le proxy grâce au patch)
+        # Connexion
         self.client = pronotepy.Client.token_login(**creds)
         
-        if not self.client.logged_in: raise RuntimeError("Token invalide")
+        # --- INJECTION DE LA SESSION PROXY ---
+        if proxy_session:
+            self.client.communication.session = proxy_session
+            log.info("✅ Session IPLoop injectée dans pronotepy.")
+        # -------------------------------------
+
+        if not self.client.logged_in: 
+            raise RuntimeError("Token invalide ou IP bloquée (Erreur 23)")
         
         log.info("Connecté avec succès !")
         new_creds = self.client.export_credentials()
@@ -487,6 +478,9 @@ class PronoteBot:
                         if 'message' in update and 'text' in update['message']:
                             log.info(f"💬 Commande reçue : {update['message']['text']}")
                             self._handle_command(update['message']['text'])
+                elif r.status_code == 409:
+                    log.warning("⚠️ Conflit Telegram (409) : Une autre instance du bot tourne encore. Attente...")
+                    time.sleep(10)
                 else:
                     log.error(f"Erreur Telegram API ({r.status_code}) : {r.text}")
                     
@@ -561,7 +555,7 @@ class PronoteBot:
                 
         except Exception as e:
             log.error(f"Erreur commande {text} : {e}")
-            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nSi c'est l'erreur 23, Pronote a bloqué le compte, il faut attendre un peu. Sinon, réessaie.")
+            self._telegram(f"❌ *Oups, une erreur est survenue :*\n`{str(e)}`\n\nL'IP est sûrement bloquée (Erreur 23) ou le proxy a échoué. Réessaie plus tard.")
 
 # ---------------------------------------------------------------------------
 # LANCEMENT
