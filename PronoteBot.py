@@ -424,7 +424,6 @@ class PronoteBot:
                     msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
                     if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
                     
-                    # Gestion intelligente des repas (str ou dict)
                     if hasattr(menu, 'meals') and menu.meals:
                         for meal in menu.meals:
                             if isinstance(meal, dict):
@@ -697,9 +696,19 @@ class PronoteBot:
                 msg = "*📊 Tes moyennes*\n\n"
                 try:
                     current_period = self.client.current_period
-                    msg += f"🎯 *Générale* : {current_period.overall_average:.2f}/20\n\n"
+                    # --- CORRECTION ICI ---
+                    try:
+                        overall = float(str(current_period.overall_average).replace(',', '.'))
+                        msg += f"🎯 *Générale* : {overall:.2f}/20\n\n"
+                    except:
+                        msg += f"🎯 *Générale* : {current_period.overall_average}/20\n\n"
+
                     for subject, avg in current_period.averages.items():
-                        msg += f"• {subject} : {avg:.2f}\n"
+                        try:
+                            avg_float = float(str(avg).replace(',', '.'))
+                            msg += f"• {subject} : {avg_float:.2f}\n"
+                        except:
+                            msg += f"• {subject} : {avg}\n"
                     self._telegram(msg)
                 except Exception as e:
                     self._telegram(f"❌ Erreur : {str(e)}")
