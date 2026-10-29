@@ -192,19 +192,18 @@ class PronoteBot:
             try:
                 period = self.client.current_period
                 overall = getattr(period, 'overall_average', '—')
-                try: cache["averages"]["general"] = float(str(overall).replace(',', '.'))
+                try: cache["averages"]["general"] = round(float(str(overall).replace(',', '.')), 2)
                 except: cache["averages"]["general"] = str(overall)
                 
                 # Extraction des moyennes par matière
-                for avg in period.averages:
-                    # Pronote peut renvoyer l'objet de plusieurs façons
-                    subj = getattr(avg.subject, 'name', 'Matière') if hasattr(avg, 'subject') else 'Matière'
-                    
-                    # La valeur peut s'appeler 'average', 'student_average', 'value' ou être l'objet lui-même
-                    val = getattr(avg, 'average', getattr(avg, 'student_average', getattr(avg, 'value', avg)))
-                    
-                    try: cache["averages"][subj] = float(str(val).replace(',', '.'))
-                    except: cache["averages"][subj] = str(val)
+                for avg_obj in period.averages:
+                    subj = avg_obj.subject.name if hasattr(avg_obj, 'subject') else 'Matière'
+                    # On lit directement la propriété .average de l'objet
+                    try:
+                        val = avg_obj.average
+                        cache["averages"][subj] = round(float(str(val).replace(',', '.')), 2)
+                    except Exception:
+                        cache["averages"][subj] = "—"
 
                 for g in period.grades:
                     cache["grades"].append({
@@ -276,7 +275,7 @@ class PronoteBot:
                     })
             except Exception as e: log.error("Erreur cache infos : %s", e)
 
-            # 6. Cantine (Correction ici pour extraire les plats)
+            # 6. Cantine (Correction pour extraire les plats)
             cache["menus"] = []
             try:
                 next_monday = today + timedelta(days=(7 - today.weekday()))
@@ -286,12 +285,11 @@ class PronoteBot:
                         meals = []
                         if hasattr(m, 'meals') and m.meals:
                             for meal in m.meals:
-                                # Pronote renvoie souvent un dictionnaire avec la clé 'nom'
                                 if isinstance(meal, dict):
-                                    name = meal.get('nom', meal.get('libelle', meal.get('name', '')))
+                                    name = meal.get('libelle') or meal.get('nom') or meal.get('name')
                                     if name: meals.append(name)
-                                else:
-                                    meals.append(str(meal))
+                                elif isinstance(meal, str):
+                                    meals.append(meal)
                         cache["menus"].append({
                             "date": f"{JOURS_FR[m.date.weekday()]} {m.date.strftime('%d/%m')}",
                             "name": getattr(m, 'name', ''),
@@ -357,7 +355,7 @@ class PronoteBot:
                 gen = avgs.pop("general", "—")
                 msg += f"🎯 *Générale* : {gen}/20\n\n"
                 for subj, val in avgs.items():
-                    msg += f"• {subj} : {val}\n"
+                    msg += f"• {subj} : {val}/20\n"
                 self._telegram(msg)
 
             elif text in ['/devoirs', '📚 devoirs demain', '📚 devoirs semaine', '/semaine']:
@@ -416,8 +414,11 @@ class PronoteBot:
                     for m in menus:
                         msg += f"*{m['date']}*\n"
                         if m['name']: msg += f"_{m['name']}_\n"
-                        for meal in m['meals']:
-                            msg += f"  • {meal}\n"
+                        if m['meals']:
+                            for meal in m['meals']:
+                                msg += f"  • {meal}\n"
+                        else:
+                            msg += "  _(Pas de plats renseignés)_\n"
                         msg += "\n"
                     self._telegram(msg)
                 else:
