@@ -47,7 +47,6 @@ class PronoteBot:
     def __init__(self):
         self.client = None
         self.last_update_id = 0
-        self.last_command_time = 0
         self.is_paused = False
 
     # --- FONCTION DE NETTOYAGE ULTIME ---
@@ -167,24 +166,26 @@ class PronoteBot:
 
     # --- CLAVIERS ---
     def _get_main_keyboard(self):
-        # Clavier permanent (en bas de l'écran) : uniquement l'essentiel
+        # Clavier persistant (mis à jour avec Messages)
         return {
             "keyboard": [
                 [{"text": "📝 Notes"}, {"text": "📚 Devoirs demain"}],
                 [{"text": "📅 Emploi du temps"}, {"text": "🍽️ Cantine"}],
-                [{"text": "➕ Plus d'options"}, {"text": "⏸️ Pause / ▶️ Reprendre"}]
+                [{"text": "💬 Messages"}, {"text": "➕ Plus d'options"}],
+                [{"text": "⏸️ Pause / ▶️ Reprendre"}]
             ],
             "resize_keyboard": True,
             "is_persistent": True
         }
 
     def _get_inline_menu(self):
-        # Menu avancé (boutons attachés au message)
+        # Menu avancé (inclut maintenant Messages)
         return {
             "inline_keyboard": [
                 [{"text": "📊 Moyennes", "callback_data": "btn_moyennes"}, {"text": "📈 Graphique", "callback_data": "btn_graphique"}],
                 [{"text": "⚠️ Contrôles / DS", "callback_data": "btn_ds"}, {"text": "📚 Devoirs (semaine)", "callback_data": "btn_semaine"}],
-                [{"text": "📢 Infos & Sondages", "callback_data": "btn_infos"}, {"text": "📄 Fichiers (24h)", "callback_data": "btn_fichiers"}]
+                [{"text": "📢 Infos & Sondages", "callback_data": "btn_infos"}, {"text": "📄 Fichiers (24h)", "callback_data": "btn_fichiers"}],
+                [{"text": "💬 Messages non lus", "callback_data": "btn_messages"}]
             ]
         }
 
@@ -528,40 +529,33 @@ class PronoteBot:
                     
                     for update in updates:
                         self.last_update_id = update['update_id']
-                        
-                        # Message texte classique
                         if 'message' in update and 'text' in update['message']:
                             self._handle_command(update['message']['text'])
-                            
-                        # Clic sur un bouton Inline
                         elif 'callback_query' in update:
                             cb = update['callback_query']
-                            # On répond vite au bouton pour arrêter le "chargement"
                             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb['id']})
                             self._handle_callback(cb['data'])
                             
-                elif r.status_code == 409:
-                    time.sleep(10)
-                else:
-                    log.error(f"Erreur Telegram API ({r.status_code})")
+                elif r.status_code == 409: time.sleep(10)
+                else: log.error(f"Erreur Telegram API ({r.status_code})")
                     
             except Exception as e:
                 log.error("Erreur polling Telegram : %s", e)
             time.sleep(1)
 
     def _handle_callback(self, data):
-        """Gère les clics sur le menu avancé (Inline)."""
         if data == "btn_moyennes": self._handle_command("/moyennes")
         elif data == "btn_graphique": self._handle_command("/graphique")
         elif data == "btn_ds": self._handle_command("/ds")
         elif data == "btn_semaine": self._handle_command("/semaine")
         elif data == "btn_infos": self._handle_command("/infos")
         elif data == "btn_fichiers": self._handle_command("/fichiers")
+        elif data == "btn_messages": self._handle_command("/messages")
 
     def _handle_command(self, text):
         text = text.lower().strip()
         
-        # --- GESTION PAUSE / REPRENDRE (Prioritaire) ---
+        # --- GESTION PAUSE / REPRENDRE ---
         if text in ['/stop', '⏸️ pause / ▶️ reprendre']:
             if self.is_paused:
                 self.is_paused = False
@@ -579,15 +573,14 @@ class PronoteBot:
             self._telegram("🚀 *Bot réactivé !*", keyboard=self._get_main_keyboard())
             return
 
-        # Anti-spam
-        if time.time() - self.last_command_time < 10 and text not in ['/menu', 'menu']:
-            self._telegram("⏳ _Doucement ! Attends 10 secondes._")
-            return
-        self.last_command_time = time.time()
+        # --- SUPPRESSION DE L'ANTI-SPAM ---
 
         try:
             if text in ['/menu', 'menu', '➕ plus d\'options']:
-                msg = "🛠️ *Menu Avancé*\nVoici les outils un peu plus poussés."
+                # On affiche d'abord le clavier persistant
+                self._telegram("👋 Voici le menu principal :", keyboard=self._get_main_keyboard())
+                # Puis le menu avancé
+                msg = "🛠️ *Menu Avancé*"
                 payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "reply_markup": self._get_inline_menu()}
                 requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=15)
                 
@@ -737,6 +730,21 @@ class PronoteBot:
                                 self._telegram_document(item.data, item.name, caption=f"📄 {lesson.subject.name}")
                 if not found:
                     self._telegram("Aucun nouveau fichier aujourd'hui.")
+
+            elif text in ['/messages', '💬 messages']:
+                self._telegram("⏳ _Recherche des messages..._")
+                self._refresh_session()
+                discussions = self.client.messages()
+                msg = "*💬 Tes derniers messages*\n\n"
+                count = 0
+                for disc in discussions:
+                    for m in disc.messages:
+                        if count >= 5: break
+                        statut = "🟢" if not m.read else "⚪"
+                        msg += f"{statut} *{m.author}* ({m.date.strftime('%d/%m')}) :\n{disc.subject} - {m.content[:80]}...\n\n"
+                        count += 1
+                    if count >= 5: break
+                self._telegram(msg if count > 0 else "Aucun message.")
                 
         except Exception as e:
             log.error(f"Erreur commande {text} : {e}")
