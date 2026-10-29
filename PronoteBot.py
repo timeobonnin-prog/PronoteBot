@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 import io
+import re  # <-- NOUVEL IMPORT POUR LE NETTOYAGE
 from datetime import datetime, timedelta, date
 from pathlib import Path
 
@@ -47,6 +48,30 @@ class PronoteBot:
         self.last_update_id = 0
         self.last_command_time = 0
 
+    # --- FONCTION DE NETTOYAGE ULTIME ---
+    def _parse_creds_robust(self, text):
+        """Extrait les identifiants avec des regex, immunisé contre les sauts de ligne et virgules manquantes."""
+        if not text: return None
+        creds = {}
+        
+        # Recherche des valeurs peu importe la mise en forme
+        match_url = re.search(r'"pronote_url"\s*:\s*"([^"]+)"', text)
+        match_user = re.search(r'"username"\s*:\s*"([^"]+)"', text)
+        match_pass = re.search(r'"password"\s*:\s*"([^"]+)"', text)
+        match_client = re.search(r'"client_identifier"\s*:\s*"([^"]+)"', text)
+        match_uuid = re.search(r'"uuid"\s*:\s*"([^"]+)"', text)
+
+        if match_url: creds["pronote_url"] = match_url.group(1)
+        if match_user: creds["username"] = match_user.group(1)
+        if match_pass: creds["password"] = match_pass.group(1)
+        if match_client: creds["client_identifier"] = match_client.group(1)
+        if match_uuid: creds["uuid"] = match_uuid.group(1)
+
+        # On vérifie qu'on a bien les infos vitales
+        if "password" in creds and "client_identifier" in creds:
+            return creds
+        return None
+
     # --- GESTION DU GIST ---
     def _gist_request(self, method, data=None):
         if not GIST_ID or not GITHUB_TOKEN: return None
@@ -64,8 +89,10 @@ class PronoteBot:
         if gist and "files" in gist and filename in gist["files"]:
             content = gist["files"][filename]["content"]
             if not content or content.strip() == "": return default
-            try: return json.loads(content)
-            except json.JSONDecodeError: return default
+            try: 
+                # On utilise aussi le parseur robuste pour le Gist !
+                return self._parse_creds_robust(content) or json.loads(content)
+            except: return default
         return default
 
     def _save_gist_file(self, filename, data):
@@ -87,22 +114,24 @@ class PronoteBot:
             except Exception as e:
                 log.error("❌ Impossible de configurer IPLoop : %s", e)
 
+        # 1. On cherche dans le Gist
         creds = self._load_gist_file("creds.json")
         if creds:
             log.info("Token récupéré depuis le Gist.")
         else:
+            # 2. Sinon on utilise Render avec le nettoyage robuste
             if not PRONOTE_CREDS_JSON: 
                 raise ValueError("Le Gist est vide et PRONOTE_CREDS_JSON est manquant sur Render.")
-            try:
-                # --- NETTOYAGE AUTOMATIQUE DU JSON ---
-                # On enlève les sauts de ligne et les espaces inutiles qui cassent le JSON
-                clean_json = PRONOTE_CREDS_JSON.strip().replace("\n", "").replace("\r", "")
-                creds = json.loads(clean_json)
-                log.info("Utilisation du token initial (Render).")
-            except json.JSONDecodeError as e:
-                log.error("❌ Le PRONOTE_CREDS_JSON est mal formaté : %s", e)
-                self._telegram("❌ *Erreur de token* : Le JSON dans Render est mal formaté. Vérifie qu'il est bien complet et sans caractères bizarres.")
-                raise
+            
+            log.info("Nettoyage automatique du JSON depuis Render...")
+            creds = self._parse_creds_robust(PRONOTE_CREDS_JSON)
+            
+            if not creds:
+                log.error("❌ Impossible de trouver les informations dans le JSON.")
+                self._telegram("❌ *Erreur de token* : Le texte collé dans Render est illisible, même après nettoyage. Vérifie qu'il contient bien 'password' et 'client_identifier'.")
+                raise ValueError("JSON illisible.")
+                
+            log.info("Utilisation du token initial (Render).")
 
         # Connexion
         self.client = pronotepy.Client.token_login(**creds)
@@ -186,10 +215,12 @@ class PronoteBot:
 
     def _check_already_sent(self, task_name, date_str):
         last_sent = self._load_gist_file("last_sent.json", {})
+        if not last_sent or not isinstance(last_sent, dict): return False
         return last_sent.get(task_name) == date_str
 
     def _mark_as_sent(self, task_name, date_str):
         last_sent = self._load_gist_file("last_sent.json", {})
+        if not last_sent or not isinstance(last_sent, dict): last_sent = {}
         last_sent[task_name] = date_str
         self._save_gist_file("last_sent.json", last_sent)
 
@@ -198,6 +229,7 @@ class PronoteBot:
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_grades.json", []))
+            if not isinstance(seen, set): seen = set()
             new_count = 0
             for period in self.client.periods:
                 overall = str(period.overall_average) if period.overall_average else "—"
@@ -216,6 +248,7 @@ class PronoteBot:
         try:
             self._refresh_session()
             old_lessons = self._load_gist_file("seen_lessons.json", {})
+            if not isinstance(old_lessons, dict): old_lessons = {}
             new_lessons, changes = {}, []
             today = date.today()
             for i in range(0, 3):
@@ -228,10 +261,10 @@ class PronoteBot:
                     new_lessons[lid] = current_state
                     if lid in old_lessons:
                         old_state = old_lessons[lid]
-                        if current_state["canceled"] and not old_state["canceled"] and not old_state["is_perm"]:
+                        if current_state["canceled"] and not old_state.get("canceled", False) and not old_state.get("is_perm", False):
                             changes.append(f"*⚠️ Cours ANNULÉ*\n📚 {lesson.subject.name}\n📅 {current_state['start']}")
-                        elif current_state["room"] != old_state["room"] and not current_state["canceled"] and not current_state["is_perm"]:
-                            changes.append(f"*🚪 Changement de salle*\n📚 {lesson.subject.name}\n📅 {current_state['start']}\n📍 {old_state['room']} ➡️ {current_state['room']}")
+                        elif current_state["room"] != old_state.get("room", '') and not current_state["canceled"] and not current_state["is_perm"]:
+                            changes.append(f"*🚪 Changement de salle*\n📚 {lesson.subject.name}\n📅 {current_state['start']}\n📍 {old_state.get('room', '')} ➡️ {current_state['room']}")
             if changes:
                 for change in changes: self._telegram(change)
             self._save_gist_file("seen_lessons.json", new_lessons)
@@ -241,6 +274,7 @@ class PronoteBot:
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_infos.json", []))
+            if not isinstance(seen, set): seen = set()
             new_count = 0
             infos = self.client.information_and_surveys()
             for item in infos:
@@ -261,6 +295,7 @@ class PronoteBot:
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_disc.json", []))
+            if not isinstance(seen, set): seen = set()
             new_count = 0
             discussions = self.client.messages()
             for disc in discussions:
@@ -279,6 +314,7 @@ class PronoteBot:
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_abs.json", []))
+            if not isinstance(seen, set): seen = set()
             new_count = 0
             absences = self.client.absences()
             for ab in absences:
@@ -295,6 +331,7 @@ class PronoteBot:
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_punishments.json", []))
+            if not isinstance(seen, set): seen = set()
             new_count = 0
             for period in self.client.periods:
                 for pun in period.punishments:
@@ -311,6 +348,7 @@ class PronoteBot:
         try:
             self._refresh_session()
             seen = set(self._load_gist_file("seen_skills.json", []))
+            if not isinstance(seen, set): seen = set()
             new_count = 0
             for period in self.client.periods:
                 for ev in period.evaluations:
