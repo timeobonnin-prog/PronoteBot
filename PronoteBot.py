@@ -97,19 +97,20 @@ class PronoteBot:
     def connect(self):
         log.info("Connexion à Pronote via Token QR Code…")
         
-        # --- CONFIGURATION DU PROXY IPLOOP (Méthode standard requests) ---
+        # --- CONFIGURATION DU PROXY IPLOOP ---
         proxy_session = None
         if IPLOOP_API_KEY:
             try:
-                # On utilise le format avec ciblage France
-                proxy_url = f"http://{IPLOOP_API_KEY}-country-FR@proxy.iploop.io:8880"
+                # Format d'authentification standard IPLoop
+                proxy_url = f"http://iploop:{IPLOOP_API_KEY}-country-FR@proxy.iploop.io:8880"
                 
                 proxy_session = requests.Session()
+                proxy_session.trust_env = False  # Empêche les variables système de prendre le dessus
                 proxy_session.proxies.update({
                     "http": proxy_url,
                     "https": proxy_url
                 })
-                log.info("✅ Session proxy IPLoop (standard) configurée.")
+                log.info("✅ Session proxy IPLoop configurée.")
             except Exception as e:
                 log.error("❌ Impossible de configurer le proxy IPLoop : %s", e)
 
