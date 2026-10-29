@@ -103,7 +103,6 @@ class PronoteBot:
                 proxy_session = requests.Session()
                 proxy_session.trust_env = False
                 proxy_session.proxies.update({"http": proxy_url, "https": proxy_url})
-                log.info(f"✅ Session proxy configurée (masquée).")
                 time.sleep(random.uniform(1.5, 3.5))
             except Exception as e: log.error("❌ Erreur proxy : %s", e)
 
@@ -132,9 +131,7 @@ class PronoteBot:
         if self.client is None or not self.client.logged_in: 
             self.connect()
         else:
-            try: 
-                time.sleep(random.uniform(0.5, 1.5))
-                self.client.session_check()
+            try: self.client.session_check()
             except Exception:
                 self.client = None
                 self.connect()
@@ -154,14 +151,6 @@ class PronoteBot:
             data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'Markdown'}
             requests.post(url, data=data, files=files, timeout=30)
         except Exception as e: log.error("Erreur envoi photo : %s", e)
-
-    def _telegram_document(self, file_bytes, filename, caption=""):
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-        try:
-            files = {'document': (filename, file_bytes)}
-            data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}
-            requests.post(url, data=data, files=files, timeout=30)
-        except Exception as e: log.error("Erreur envoi document : %s", e)
 
     # --- CLAVIERS ---
     def _get_main_keyboard(self):
@@ -186,338 +175,307 @@ class PronoteBot:
             ]
         }
 
-    def _is_vacation(self):
-        today = date.today()
-        for i in range(1, 6):
-            next_day = today + timedelta(days=i)
-            if next_day.weekday() >= 5: continue
+    # --- MISE A JOUR DU CACHE (Appelé 4 fois par jour) ---
+    def update_cache(self):
+        if self.is_paused: 
+            log.info("Bot en pause, pas de mise à jour du cache.")
+            return
+            
+        try:
+            self._refresh_session()
+            log.info("Mise à jour du cache en cours...")
+            cache = {}
+
+            # 1. Notes et Moyennes
+            cache["grades"] = []
+            cache["averages"] = {}
             try:
-                if self.client.lessons(next_day, next_day): return False
-            except Exception: pass
-        return True
+                period = self.client.current_period
+                overall = getattr(period, 'overall_average', '—')
+                try: cache["averages"]["general"] = float(str(overall).replace(',', '.'))
+                except: cache["averages"]["general"] = str(overall)
+                
+                for avg in period.averages:
+                    subj = getattr(avg.subject, 'name', 'Inconnu') if hasattr(avg, 'subject') else 'Inconnu'
+                    val = getattr(avg, 'average', '—')
+                    try: cache["averages"][subj] = float(str(val).replace(',', '.'))
+                    except: cache["averages"][subj] = str(val)
 
-    def _check_already_sent(self, task_name, date_str):
-        last_sent = self._load_gist_file("last_sent.json", {})
-        return last_sent.get(task_name) == date_str if isinstance(last_sent, dict) else False
-
-    def _mark_as_sent(self, task_name, date_str):
-        last_sent = self._load_gist_file("last_sent.json", {})
-        if not isinstance(last_sent, dict): last_sent = {}
-        last_sent[task_name] = date_str
-        self._save_gist_file("last_sent.json", last_sent)
-
-    # --- FICHIERS DES COURS (Automatique) ---
-    def check_lesson_files(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            seen_files = set(self._load_gist_file("seen_files.json", []))
-            new_count = 0
-            today = date.today()
-            lessons = self.client.lessons(today - timedelta(days=1), today + timedelta(days=1))
-            for lesson in lessons:
-                if hasattr(lesson, 'content') and lesson.content:
-                    for item in lesson.content:
-                        if getattr(item, 'type', 0) == 1:
-                            fid = f"{lesson.subject.name}|{item.name}"
-                            if fid not in seen_files:
-                                try:
-                                    self._telegram_document(item.data, item.name, caption=f"📄 Nouveau document : *{lesson.subject.name}*")
-                                    seen_files.add(fid)
-                                    new_count += 1
-                                except Exception: pass
-            if new_count: self._save_gist_file("seen_files.json", list(seen_files))
-        except Exception as e: log.error("Erreur check_lesson_files : %s", e)
-
-    # --- TÂCHES AUTOMATIQUES ---
-    def check_grades(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            seen = set(self._load_gist_file("seen_grades.json", []))
-            new_count = 0
-            for period in self.client.periods:
-                overall = str(period.overall_average) if period.overall_average else "—"
                 for g in period.grades:
-                    gid = f"{g.grade}|{g.subject.name[:30]}|{(g.comment or '')[:40]}|{g.date.strftime('%Y-%m-%d')}"
-                    if gid not in seen:
-                        note_str = f"{g.grade}/{g.out_of}" if g.grade else "Non noté"
-                        msg = f"*Nouvelle note – {g.subject.name}*\n📝 Note : *{note_str}*\n📅 Date : {g.date.strftime('%d/%m/%Y')}\n💬 Évaluation : {g.comment or '—'}\n🎯 Moyenne générale : {overall}"
-                        self._telegram(msg)
-                        seen.add(gid)
-                        new_count += 1
-            if new_count: self._save_gist_file("seen_grades.json", list(seen))
-        except Exception as e: log.error("Erreur check_grades : %s", e)
+                    cache["grades"].append({
+                        "subject": g.subject.name,
+                        "grade": str(g.grade),
+                        "out_of": str(g.out_of),
+                        "date": g.date.strftime('%d/%m/%Y'),
+                        "comment": g.comment or '—'
+                    })
+            except Exception as e: log.error("Erreur cache notes : %s", e)
 
-    def check_lesson_changes(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            old_lessons = self._load_gist_file("seen_lessons.json", {})
-            new_lessons, changes = {}, []
-            today = date.today()
-            for i in range(0, 3):
-                target_date = today + timedelta(days=i)
-                lessons = self.client.lessons(target_date, target_date)
-                for lesson in lessons:
-                    lid = f"{target_date.strftime('%Y-%m-%d')}|{lesson.start.strftime('%H:%M')}|{lesson.subject.name}"
-                    is_perm = getattr(lesson, 'is_permanent', False) or "perm" in str(lesson.subject.name).lower()
-                    current_state = {"canceled": lesson.canceled or lesson.exempted, "room": getattr(lesson, 'classroom', ''), "subject": lesson.subject.name, "start": lesson.start.strftime("%d/%m à %H:%M"), "is_perm": is_perm}
-                    new_lessons[lid] = current_state
-                    if lid in old_lessons:
-                        old_state = old_lessons[lid]
-                        if current_state["canceled"] and not old_state.get("canceled", False) and not old_state.get("is_perm", False):
-                            changes.append(f"*⚠️ Cours ANNULÉ*\n📚 {lesson.subject.name}\n📅 {current_state['start']}")
-                        elif current_state["room"] != old_state.get("room", '') and not current_state["canceled"] and not current_state["is_perm"]:
-                            changes.append(f"*🚪 Changement de salle*\n📚 {lesson.subject.name}\n📅 {current_state['start']}\n📍 {old_state.get('room', '')} ➡️ {current_state['room']}")
-            if changes:
-                for change in changes: self._telegram(change)
-            self._save_gist_file("seen_lessons.json", new_lessons)
-        except Exception as e: log.error("Erreur check_lesson_changes : %s", e)
+            # 2. Devoirs
+            cache["homework"] = []
+            try:
+                today = date.today()
+                for i in range(7):
+                    day = today + timedelta(days=i)
+                    if day.weekday() >= 5: continue
+                    hws = self.client.homework(day, day)
+                    for hw in hws:
+                        if not hw.done:
+                            cache["homework"].append({
+                                "date": f"{JOURS_FR[day.weekday()]} {day.strftime('%d/%m')}",
+                                "subject": hw.subject.name,
+                                "description": hw.description
+                            })
+            except Exception as e: log.error("Erreur cache devoirs : %s", e)
 
-    def check_informations(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            seen = set(self._load_gist_file("seen_infos.json", []))
-            new_count = 0
-            infos = self.client.information_and_surveys()
-            for item in infos:
-                iid = f"{item.creation_date.strftime('%Y-%m-%d')}|{item.title}"
-                if iid not in seen:
-                    is_sondage = "sondage" in str(item.category).lower() or "sondage" in item.title.lower()
-                    icon = "📊" if is_sondage else "📢"
-                    type_txt = "Nouveau Sondage" if is_sondage else "Nouvelle Information"
-                    content = f"\n📝 {item.content[:200]}..." if getattr(item, 'content', None) else ""
-                    msg = f"*{icon} {type_txt}*\n📌 {item.title}\n📅 {item.creation_date.strftime('%d/%m/%Y')}{content}"
-                    self._telegram(msg)
-                    seen.add(iid)
-                    new_count += 1
-            if new_count: self._save_gist_file("seen_infos.json", list(seen))
-        except Exception as e: log.error("Erreur check_informations : %s", e)
+            # 3. Emploi du temps
+            cache["timetable"] = []
+            try:
+                for i in range(7):
+                    day = today + timedelta(days=i)
+                    if day.weekday() >= 5: continue
+                    lessons = self.client.lessons(day, day)
+                    for l in lessons:
+                        cache["timetable"].append({
+                            "date": f"{JOURS_FR[day.weekday()]} {day.strftime('%d/%m')}",
+                            "time": l.start.strftime('%H:%M'),
+                            "subject": l.subject.name,
+                            "room": getattr(l, 'classroom', '')
+                        })
+            except Exception as e: log.error("Erreur cache emploi : %s", e)
 
-    def check_discussions(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            seen = set(self._load_gist_file("seen_disc.json", []))
-            new_count = 0
-            discussions = self.client.discussions()
-            for disc in discussions:
-                for msg in disc.messages:
-                    is_read = getattr(msg, 'read', True)
-                    if not is_read:
-                        mid = f"{disc.id}|{msg.id}"
-                        if mid not in seen:
-                            txt = f"*💬 Nouveau message – {msg.author}*\n📌 {disc.subject}\n📝 {msg.content[:150]}..."
-                            self._telegram(txt)
-                            seen.add(mid)
-                            new_count += 1
-            if new_count: self._save_gist_file("seen_disc.json", list(seen))
-        except Exception as e: log.error("Erreur check_discussions : %s", e)
+            # 4. Messages
+            cache["messages"] = []
+            try:
+                discussions = self.client.discussions()
+                for disc in discussions:
+                    for m in disc.messages:
+                        if not getattr(m, 'read', True):
+                            cache["messages"].append({
+                                "author": m.author,
+                                "subject": disc.subject,
+                                "content": m.content[:100],
+                                "date": m.date.strftime('%d/%m')
+                            })
+            except Exception as e: log.error("Erreur cache messages : %s", e)
 
-    def check_absences(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            seen = set(self._load_gist_file("seen_abs.json", []))
-            new_count = 0
-            absences = self.client.absences()
-            for ab in absences:
-                aid = f"{ab.from_date.strftime('%Y-%m-%d')}|{ab.to_date.strftime('%Y-%m-%d')}"
-                if aid not in seen:
-                    msg = f"*⚠️ Absence/Retard*\n📅 {ab.from_date.strftime('%d/%m/%Y %H:%M')}\n💬 {ab.reasons or '—'}"
-                    self._telegram(msg)
-                    seen.add(aid)
-                    new_count += 1
-            if new_count: self._save_gist_file("seen_abs.json", list(seen))
-        except Exception as e: log.error("Erreur check_absences : %s", e)
+            # 5. Informations
+            cache["infos"] = []
+            try:
+                infos = self.client.information_and_surveys()
+                for item in infos[:5]:
+                    cache["infos"].append({
+                        "title": item.title,
+                        "date": item.creation_date.strftime('%d/%m'),
+                        "content": getattr(item, 'content', '')[:200]
+                    })
+            except Exception as e: log.error("Erreur cache infos : %s", e)
 
-    def check_punishments(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            seen = set(self._load_gist_file("seen_punishments.json", []))
-            new_count = 0
-            for period in self.client.periods:
-                for pun in period.punishments:
-                    pid = f"{pun.id}"
-                    if pid not in seen:
-                        msg = f"*⚖️ Nouvelle Punition/Sanction*\n📅 {pun.date.strftime('%d/%m/%Y')}\n💬 Motif : {pun.reason or '—'}\n⏱️ Durée : {pun.duration or '—'}"
-                        self._telegram(msg)
-                        seen.add(pid)
-                        new_count += 1
-            if new_count: self._save_gist_file("seen_punishments.json", list(seen))
-        except Exception as e: log.error("Erreur check_punishments : %s", e)
+            # 6. Cantine
+            cache["menus"] = []
+            try:
+                next_monday = today + timedelta(days=(7 - today.weekday()))
+                menus = self.client.menus(next_monday, next_monday + timedelta(days=6))
+                for m in menus:
+                    if hasattr(m, 'date') and m.date:
+                        meals = []
+                        if hasattr(m, 'meals') and m.meals:
+                            for meal in m.meals:
+                                if isinstance(meal, dict):
+                                    name = meal.get('nom', meal.get('libelle', meal.get('name', '')))
+                                    if name: meals.append(name)
+                                else: meals.append(str(meal))
+                        cache["menus"].append({
+                            "date": f"{JOURS_FR[m.date.weekday()]} {m.date.strftime('%d/%m')}",
+                            "name": getattr(m, 'name', ''),
+                            "meals": meals
+                        })
+            except Exception as e: log.error("Erreur cache cantine : %s", e)
 
-    def check_skills(self):
-        if self.is_paused: return
-        try:
-            self._refresh_session()
-            seen = set(self._load_gist_file("seen_skills.json", []))
-            new_count = 0
-            for period in self.client.periods:
-                for ev in period.evaluations:
-                    for acq in ev.acquisitions:
-                        aid = f"{ev.id}|{acq.id}"
-                        if aid not in seen:
-                            color = COULEURS_COMPETENCES.get(acq.level.lower(), "⚪")
-                            msg = f"*🎯 Nouvelle Compétence*\n📚 {ev.subject.name}\n📝 {acq.name}\n{color} Niveau : *{acq.level}*"
-                            self._telegram(msg)
-                            seen.add(aid)
-                            new_count += 1
-            if new_count: self._save_gist_file("seen_skills.json", list(seen))
-        except Exception as e: log.error("Erreur check_skills : %s", e)
+            cache["last_update"] = datetime.now().strftime("%d/%m/%Y à %H:%M")
+            self._save_gist_file("cache_data.json", cache)
+            log.info("✅ Cache mis à jour avec succès.")
 
-    def check_homework_and_timetable_daily(self):
-        if self.is_paused: return
-        today_str = date.today().strftime("%Y-%m-%d")
-        if self._check_already_sent("devoirs_edt", today_str): return
-        try:
-            self._refresh_session()
-            if self._is_vacation(): return
-            today = date.today()
-            if today.weekday() >= 5: return
-            tomorrow = today + timedelta(days=1)
-            
-            timetable_msg = ""
-            lessons = self.client.lessons(tomorrow, tomorrow)
-            if lessons:
-                timetable_msg = f"*📅 Emploi du temps de demain ({JOURS_FR[tomorrow.weekday()]} {tomorrow.strftime('%d/%m')})*\n"
-                for l in lessons:
-                    salle = f" - Salle {l.classroom}" if l.classroom else ""
-                    prof = f" ({l.teacher_name})" if l.teacher_name else ""
-                    timetable_msg += f"• {l.start.strftime('%H:%M')} : *{l.subject.name}*{prof}{salle}\n"
-                timetable_msg += "\n"
-
-            homework_msg = ""
-            homeworks = self.client.homework(tomorrow, tomorrow)
-            unfinished = [hw for hw in homeworks if not hw.done]
-            if unfinished:
-                homework_msg = "*📚 Devoirs NON FAITS pour demain*\n\n"
-                for hw in unfinished:
-                    homework_msg += f"• *{hw.subject.name}* : {hw.description[:150]}\n"
-                homework_msg += "\n"
-
-            if timetable_msg or homework_msg:
-                self._telegram(timetable_msg + homework_msg)
-                self._mark_as_sent("devoirs_edt", today_str)
-        except Exception as e: log.error("Erreur devoirs/edt : %s", e)
-
-    def check_menus(self):
-        if self.is_paused: return
-        today_str = date.today().strftime("%Y-%m-%d")
-        if self._check_already_sent("menus", today_str): return
-        try:
-            self._refresh_session()
-            today = date.today()
-            next_monday = today + timedelta(days=(7 - today.weekday()))
-            next_sunday = next_monday + timedelta(days=6)
-            menus = self.client.menus(next_monday, next_sunday)
-            if not menus: return
-
-            msg = "*🍽️ Menus de la cantine (Semaine prochaine)*\n\n"
-            has_content = False
-            for menu in menus:
-                if hasattr(menu, 'date') and menu.date:
-                    jour_fr = JOURS_FR[menu.date.weekday()]
-                    msg += f"*{jour_fr} {menu.date.strftime('%d/%m')}*\n"
-                    if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
-                    
-                    if hasattr(menu, 'meals') and menu.meals:
-                        for meal in menu.meals:
-                            if isinstance(meal, dict):
-                                meal_name = meal.get('nom', meal.get('libelle', meal.get('name', '')))
-                                if meal_name: msg += f"  • {meal_name}\n"
-                            elif isinstance(meal, str):
-                                msg += f"  • {meal}\n"
-                            else:
-                                msg += f"  • {str(meal)}\n"
-                        has_content = True
-                    elif hasattr(menu, 'name') and menu.name: has_content = True
-                    msg += "\n"
-            if has_content:
-                self._telegram(msg)
-                self._mark_as_sent("menus", today_str)
-        except Exception as e: log.error("Erreur menus : %s", e)
-
-    def send_weekly_summary(self):
-        if self.is_paused: return
-        today_str = date.today().strftime("%Y-%m-%d")
-        if self._check_already_sent("bilan", today_str): return
-        try:
-            self._refresh_session()
-            if self._is_vacation():
-                self._telegram("🏖️ *Bonnes vacances !*")
-                self._mark_as_sent("bilan", today_str)
-                return
-
-            today = date.today()
-            one_week_ago = today - timedelta(days=7)
-            new_grades_count, total_pts, total_out = 0, 0, 0
-            for period in self.client.periods:
-                for g in period.grades:
-                    if g.date >= one_week_ago and g.date <= today and g.grade and g.out_of:
-                        try:
-                            note = float(str(g.grade).replace(',', '.'))
-                            bareme = float(str(g.out_of).replace(',', '.'))
-                            if bareme > 0:
-                                total_pts += (note / bareme) * 20
-                                total_out += 1
-                                new_grades_count += 1
-                        except ValueError: pass
-
-            hw_count = 0
-            try: hw_count = len(self.client.homework(today, today + timedelta(days=7)))
-            except Exception: pass
-
-            moyenne_str = f"{(total_pts / total_out):.2f}/20" if total_out > 0 else "—"
-            msg = f"📊 *Bilan de la semaine*\n\n📝 Nouvelles notes : *{new_grades_count}*\n📈 Moyenne : *{moyenne_str}*\n\n📚 Devoirs à venir : *{hw_count}*\n"
-            self._telegram(msg)
-            self._mark_as_sent("bilan", today_str)
-            self._generate_grade_chart()
-        except Exception as e: log.error("Erreur bilan : %s", e)
-
-    def _generate_grade_chart(self):
-        try:
-            grades_data = []
-            for period in self.client.periods:
-                for g in period.grades:
-                    if g.grade and g.out_of:
-                        try:
-                            note = float(str(g.grade).replace(',', '.'))
-                            bareme = float(str(g.out_of).replace(',', '.'))
-                            if bareme > 0: grades_data.append((g.date, (note / bareme) * 20))
-                        except ValueError: pass
-            if not grades_data: return
-
-            grades_data.sort(key=lambda x: x[0])
-            dates = [g[0] for g in grades_data]
-            notes = [g[1] for g in grades_data]
-
-            plt.style.use('dark_background')
-            fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(dates, notes, marker='o', linestyle='-', color='#00d2ff', linewidth=2, markersize=6, markerfacecolor='#ff0055')
-            
-            moyenne_generale = sum(notes) / len(notes)
-            ax.axhline(y=moyenne_generale, color='#ff0055', linestyle='--', alpha=0.7, label=f'Moyenne ({moyenne_generale:.2f}/20)')
-            
-            ax.set_title("Évolution de tes notes (/20)", color='white', fontsize=14, pad=15)
-            ax.set_ylabel("Note", color='#aaaaaa')
-            ax.grid(color='#333333', linestyle=':', alpha=0.7)
-            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
-            fig.autofmt_xdate(rotation=45)
-            ax.legend(facecolor='#222222', edgecolor='#555555')
-            
-            buf = io.BytesIO()
-            plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
-            buf.seek(0)
-            plt.close()
-            self._telegram_photo(buf, caption="📈 *Ton évolution au fil du temps*")
         except Exception as e:
-            log.error("Erreur graphique : %s", e)
+            log.error("❌ Erreur lors de la mise à jour du cache : %s", e)
 
-    # --- POLLING ET GESTION DES BOUTONS ---
+    # --- COMMANDES TELEGRAM (Lecture seule dans le cache) ---
+    def _handle_command(self, text):
+        text = text.lower().strip()
+        
+        if text in ['/stop', '⏸️ pause / ▶️ reprendre']:
+            if self.is_paused:
+                self.is_paused = False
+                self._save_gist_file("settings.json", {"paused": False})
+                self._telegram("🚀 *Bot réactivé !*")
+            else:
+                self.is_paused = True
+                self._save_gist_file("settings.json", {"paused": True})
+                self._telegram("💤 *Mode Pause activé.*")
+            return
+            
+        elif text == '/start':
+            self.is_paused = False
+            self._save_gist_file("settings.json", {"paused": False})
+            self._telegram("🚀 *Bot réactivé !*", keyboard=self._get_main_keyboard())
+            return
+
+        # Lecture du cache
+        cache = self._load_gist_file("cache_data.json")
+        if not cache or "last_update" not in cache:
+            self._telegram("⚠️ *Le cache est vide.* Attends la prochaine mise à jour automatique (9h, 12h, 14h30 ou 19h30).")
+            return
+
+        last_up = cache["last_update"]
+
+        try:
+            if text in ['/menu', 'menu', '➕ plus d\'options']:
+                self._telegram(f"👋 Voici le menu principal.\n_(Dernière mise à jour : {last_up})_", keyboard=self._get_main_keyboard())
+                payload = {"chat_id": TELEGRAM_CHAT_ID, "text": "🛠️ *Menu Avancé*", "parse_mode": "Markdown", "reply_markup": self._get_inline_menu()}
+                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=15)
+                
+            elif text in ['/notes', '📝 notes']:
+                msg = f"*📝 Tes 5 dernières notes*\n_(MàJ : {last_up})_\n\n"
+                grades = cache.get("grades", [])[:5]
+                if grades:
+                    for g in grades:
+                        msg += f"• {g['date']} *{g['subject']}* : {g['grade']}/{g['out_of']}\n"
+                    self._telegram(msg)
+                else:
+                    self._telegram("Aucune note dans le cache.")
+
+            elif text in ['/moyennes']:
+                msg = f"*📊 Tes moyennes*\n_(MàJ : {last_up})_\n\n"
+                avgs = cache.get("averages", {})
+                gen = avgs.pop("general", "—") # On extrait la générale
+                msg += f"🎯 *Générale* : {gen}/20\n\n"
+                for subj, val in avgs.items():
+                    msg += f"• {subj} : {val}\n"
+                self._telegram(msg)
+
+            elif text in ['/devoirs', '📚 devoirs demain', '📚 devoirs semaine', '/semaine']:
+                msg = f"*📚 Devoirs de la semaine*\n_(MàJ : {last_up})_\n\n"
+                hws = cache.get("homework", [])
+                current_date = ""
+                if hws:
+                    for hw in hws:
+                        if hw['date'] != current_date:
+                            current_date = hw['date']
+                            msg += f"*{current_date}*\n"
+                        msg += f"  • {hw['subject']} : {hw['description'][:80]}\n"
+                    self._telegram(msg)
+                else:
+                    self._telegram("✅ Aucun devoir dans le cache.")
+
+            elif text in ['/emploi', '📅 emploi du temps']:
+                msg = f"*📅 Emploi du temps*\n_(MàJ : {last_up})_\n\n"
+                edt = cache.get("timetable", [])
+                current_date = ""
+                if edt:
+                    for l in edt:
+                        if l['date'] != current_date:
+                            current_date = l['date']
+                            msg += f"*{current_date}*\n"
+                        room = f" ({l['room']})" if l['room'] else ""
+                        msg += f"  • {l['time']} {l['subject']}{room}\n"
+                    self._telegram(msg)
+                else:
+                    self._telegram("Aucun cours dans le cache.")
+
+            elif text in ['/messages', '💬 messages']:
+                msg = f"*💬 Messages non lus*\n_(MàJ : {last_up})_\n\n"
+                msgs = cache.get("messages", [])
+                if msgs:
+                    for m in msgs:
+                        msg += f"🟢 *{m['author']}* ({m['date']}) :\n{m['subject']} - {m['content']}...\n\n"
+                    self._telegram(msg)
+                else:
+                    self._telegram("Aucun nouveau message.")
+
+            elif text in ['/infos']:
+                msg = f"*📢 Dernières informations*\n_(MàJ : {last_up})_\n\n"
+                infos = cache.get("infos", [])
+                if infos:
+                    for i in infos:
+                        msg += f"• *{i['title']}* ({i['date']})\n"
+                    self._telegram(msg)
+                else:
+                    self._telegram("Aucune info.")
+
+            elif text in ['/cantine', '🍽️ cantine']:
+                msg = f"*🍽️ Menus de la cantine*\n_(MàJ : {last_up})_\n\n"
+                menus = cache.get("menus", [])
+                if menus:
+                    for m in menus:
+                        msg += f"*{m['date']}*\n"
+                        if m['name']: msg += f"_{m['name']}_\n"
+                        for meal in m['meals']:
+                            msg += f"  • {meal}\n"
+                        msg += "\n"
+                    self._telegram(msg)
+                else:
+                    self._telegram("Aucun menu.")
+
+            elif text in ['/ds']:
+                msg = f"*⚠️ Tes prochains contrôles / DS*\n_(MàJ : {last_up})_\n\n"
+                hws = cache.get("homework", [])
+                keywords = ["ds", "controle", "contrôle", "interro", "evaluation", "évaluation", "test"]
+                found = False
+                for hw in hws:
+                    if any(kw in hw['description'].lower() for kw in keywords):
+                        found = True
+                        msg += f"• *{hw['date']}* - {hw['subject']} :\n  {hw['description'][:100]}...\n"
+                self._telegram(msg if found else "✅ Aucun contrôle détecté.")
+
+            elif text in ['/graphique', '📈 graphique']:
+                self._telegram("⏳ _Génération du graphique depuis le cache..._")
+                grades = cache.get("grades", [])
+                if not grades:
+                    self._telegram("Pas assez de notes pour faire un graphique.")
+                    return
+                
+                # Recréation du graphique avec les données du cache
+                import matplotlib.pyplot as plt
+                import matplotlib.dates as mdates
+                from datetime import datetime
+                
+                grades_data = []
+                for g in grades:
+                    try:
+                        note = float(g['grade'].replace(',', '.'))
+                        bareme = float(g['out_of'].replace(',', '.'))
+                        if bareme > 0:
+                            dt = datetime.strptime(g['date'], '%d/%m/%Y')
+                            grades_data.append((dt, (note / bareme) * 20))
+                    except: pass
+                
+                if not grades_data: return
+                grades_data.sort(key=lambda x: x[0])
+                dates = [g[0] for g in grades_data]
+                notes = [g[1] for g in grades_data]
+
+                plt.style.use('dark_background')
+                fig, ax = plt.subplots(figsize=(10, 5))
+                ax.plot(dates, notes, marker='o', linestyle='-', color='#00d2ff', linewidth=2, markerfacecolor='#ff0055')
+                moyenne = sum(notes) / len(notes)
+                ax.axhline(y=moyenne, color='#ff0055', linestyle='--', label=f'Moyenne ({moyenne:.2f}/20)')
+                ax.set_title("Évolution de tes notes (/20)", color='white')
+                ax.grid(color='#333333', linestyle=':')
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%d/%m'))
+                fig.autofmt_xdate(rotation=45)
+                ax.legend()
+                
+                buf = io.BytesIO()
+                plt.savefig(buf, format='png', bbox_inches='tight', dpi=150)
+                buf.seek(0)
+                plt.close()
+                self._telegram_photo(buf, caption="📈 *Ton évolution (depuis le cache)*")
+                
+        except Exception as e:
+            log.error(f"Erreur commande cache {text} : {e}")
+            self._telegram(f"❌ *Erreur de lecture du cache :*\n`{str(e)}`")
+
+    # --- POLLING TELEGRAM ---
     def _poll_telegram(self):
         requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook")
         log.info("Écoute des messages Telegram en cours...")
@@ -531,8 +489,6 @@ class PronoteBot:
                 if r.status_code == 200:
                     data = r.json()
                     updates = data.get('result', [])
-                    if updates: log.info(f"📥 {len(updates)} interaction(s) reçue(s).")
-                    
                     for update in updates:
                         self.last_update_id = update['update_id']
                         if 'message' in update and 'text' in update['message']:
@@ -540,250 +496,20 @@ class PronoteBot:
                         elif 'callback_query' in update:
                             cb = update['callback_query']
                             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", json={"callback_query_id": cb['id']})
-                            self._handle_callback(cb['data'])
+                            data = cb['data']
+                            # Redirection des boutons vers les commandes
+                            if data == "btn_moyennes": self._handle_command("/moyennes")
+                            elif data == "btn_graphique": self._handle_command("/graphique")
+                            elif data == "btn_ds": self._handle_command("/ds")
+                            elif data == "btn_semaine": self._handle_command("/semaine")
+                            elif data == "btn_infos": self._handle_command("/infos")
+                            elif data == "btn_messages": self._handle_command("/messages")
                             
                 elif r.status_code == 409: time.sleep(10)
-                else: log.error(f"Erreur Telegram API ({r.status_code})")
                     
             except Exception as e:
                 log.error("Erreur polling Telegram : %s", e)
             time.sleep(1)
-
-    def _handle_callback(self, data):
-        if data == "btn_moyennes": self._handle_command("/moyennes")
-        elif data == "btn_graphique": self._handle_command("/graphique")
-        elif data == "btn_ds": self._handle_command("/ds")
-        elif data == "btn_semaine": self._handle_command("/semaine")
-        elif data == "btn_infos": self._handle_command("/infos")
-        elif data == "btn_fichiers": self._handle_command("/fichiers")
-        elif data == "btn_messages": self._handle_command("/messages")
-
-    def _handle_command(self, text):
-        text = text.lower().strip()
-        
-        # --- GESTION PAUSE / REPRENDRE ---
-        if text in ['/stop', '⏸️ pause / ▶️ reprendre']:
-            if self.is_paused:
-                self.is_paused = False
-                self._save_gist_file("settings.json", {"paused": False})
-                self._telegram("🚀 *Bot réactivé !* Je recommence à surveiller Pronote.")
-            else:
-                self.is_paused = True
-                self._save_gist_file("settings.json", {"paused": True})
-                self._telegram("💤 *Mode Pause activé.* Le bot est en veille.")
-            return
-            
-        elif text == '/start':
-            self.is_paused = False
-            self._save_gist_file("settings.json", {"paused": False})
-            self._telegram("🚀 *Bot réactivé !*", keyboard=self._get_main_keyboard())
-            return
-
-        try:
-            if text in ['/menu', 'menu', '➕ plus d\'options']:
-                self._telegram("👋 Voici le menu principal :", keyboard=self._get_main_keyboard())
-                msg = "🛠️ *Menu Avancé*"
-                payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown", "reply_markup": self._get_inline_menu()}
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=15)
-                
-            elif text in ['/notes', '📝 notes']:
-                self._telegram("⏳ _Recherche en cours..._")
-                self._refresh_session()
-                msg = "*📝 Tes 5 dernières notes*\n\n"
-                count = 0
-                for period in self.client.periods:
-                    for g in period.grades:
-                        if count >= 5: break
-                        note_str = f"{g.grade}/{g.out_of}" if g.grade else "Non noté"
-                        msg += f"• {g.date.strftime('%d/%m')} *{g.subject.name}* : {note_str}\n"
-                        count += 1
-                    if count >= 5: break
-                self._telegram(msg if count > 0 else "Aucune note trouvée.")
-                
-            elif text in ['/devoirs', '📚 devoirs demain']:
-                self._telegram("⏳ _Recherche en cours..._")
-                self._refresh_session()
-                tomorrow = date.today() + timedelta(days=1)
-                homeworks = self.client.homework(tomorrow, tomorrow)
-                unfinished = [hw for hw in homeworks if not hw.done]
-                if unfinished:
-                    msg = "*📚 Devoirs pour demain*\n\n"
-                    for hw in unfinished:
-                        msg += f"• *{hw.subject.name}* : {hw.description[:100]}\n"
-                    self._telegram(msg)
-                else:
-                    self._telegram("✅ Aucun devoir non fait !")
-
-            elif text == '/semaine':
-                self._telegram("⏳ _Recherche en cours..._")
-                self._refresh_session()
-                today = date.today()
-                msg = "*📚 Devoirs de la semaine*\n\n"
-                has_hw = False
-                for i in range(7):
-                    day = today + timedelta(days=i)
-                    if day.weekday() >= 5: continue
-                    hws = self.client.homework(day, day)
-                    unfinished = [hw for hw in hws if not hw.done]
-                    if unfinished:
-                        has_hw = True
-                        msg += f"*{JOURS_FR[day.weekday()]} {day.strftime('%d/%m')}*\n"
-                        for hw in unfinished:
-                            msg += f"  • {hw.subject.name} : {hw.description[:80]}\n"
-                self._telegram(msg if has_hw else "✅ Aucun devoir cette semaine !")
-                    
-            elif text in ['/emploi', '📅 emploi du temps']:
-                self._telegram("⏳ _Recherche en cours..._")
-                self._refresh_session()
-                today = date.today()
-                msg = "*📅 Emploi du temps de la semaine*\n\n"
-                has_lessons = False
-                for i in range(7):
-                    day = today + timedelta(days=i)
-                    if day.weekday() >= 5: continue
-                    lessons = self.client.lessons(day, day)
-                    if lessons:
-                        has_lessons = True
-                        msg += f"*{JOURS_FR[day.weekday()]} {day.strftime('%d/%m')}*\n"
-                        for l in lessons:
-                            salle = f" ({l.classroom})" if l.classroom else ""
-                            msg += f"  • {l.start.strftime('%H:%M')} {l.subject.name}{salle}\n"
-                self._telegram(msg if has_lessons else "Aucun cours cette semaine.")
-                
-            elif text in ['/graphique', '📈 graphique']:
-                self._telegram("⏳ _Génération en cours..._")
-                self._refresh_session()
-                self._generate_grade_chart()
-
-            elif text in ['/cantine', '🍽️ cantine']:
-                self._telegram("⏳ _Recherche du menu..._")
-                self._refresh_session()
-                today = date.today()
-                next_monday = today + timedelta(days=(7 - today.weekday()))
-                next_sunday = next_monday + timedelta(days=6)
-                menus = self.client.menus(next_monday, next_sunday)
-                if not menus:
-                    self._telegram("Aucun menu publié.")
-                else:
-                    msg = "*🍽️ Menus de la cantine*\n\n"
-                    for menu in menus:
-                        if hasattr(menu, 'date') and menu.date:
-                            msg += f"*{JOURS_FR[menu.date.weekday()]} {menu.date.strftime('%d/%m')}*\n"
-                            if hasattr(menu, 'name') and menu.name: msg += f"_{menu.name}_\n"
-                            
-                            if hasattr(menu, 'meals') and menu.meals:
-                                for meal in menu.meals:
-                                    if isinstance(meal, dict):
-                                        meal_name = meal.get('nom', meal.get('libelle', meal.get('name', '')))
-                                        if meal_name: msg += f"  • {meal_name}\n"
-                                    elif isinstance(meal, str):
-                                        msg += f"  • {meal}\n"
-                                    else:
-                                        msg += f"  • {str(meal)}\n"
-                            msg += "\n"
-                    self._telegram(msg)
-
-            elif text == '/debug_menu':
-                self._telegram("⏳ _Analyse des données brutes..._")
-                self._refresh_session()
-                today = date.today()
-                next_monday = today + timedelta(days=(7 - today.weekday()))
-                menus = self.client.menus(next_monday, next_monday + timedelta(days=6))
-                if not menus:
-                    self._telegram("Aucun menu à analyser.")
-                else:
-                    for m in menus:
-                        debug_msg = f"Date: {m.date}\nNom: {m.name}\nRepas brut: `{str(m.meals)}`\n"
-                        self._telegram(debug_msg)
-
-            elif text == '/moyennes':
-                self._telegram("⏳ _Calcul des moyennes..._")
-                self._refresh_session()
-                msg = "*📊 Tes moyennes*\n\n"
-                try:
-                    current_period = self.client.current_period
-                    overall = getattr(current_period, 'overall_average', '—')
-                    try:
-                        msg += f"🎯 *Générale* : {float(str(overall).replace(',', '.')):.2f}/20\n\n"
-                    except:
-                        msg += f"🎯 *Générale* : {overall}/20\n\n"
-
-                    for avg in current_period.averages:
-                        subject_name = getattr(avg.subject, 'name', 'Matière inconnue') if hasattr(avg, 'subject') else 'Matière'
-                        val = getattr(avg, 'average', '—')
-                        try:
-                            val_float = float(str(val).replace(',', '.'))
-                            msg += f"• {subject_name} : {val_float:.2f}\n"
-                        except:
-                            msg += f"• {subject_name} : {val}\n"
-                    self._telegram(msg)
-                except Exception as e:
-                    self._telegram(f"❌ Erreur : {str(e)}")
-
-            elif text == '/ds':
-                self._telegram("⏳ _Recherche des contrôles..._")
-                self._refresh_session()
-                today = date.today()
-                msg = "*⚠️ Tes prochains contrôles / DS*\n\n"
-                found = False
-                keywords = ["ds", "controle", "contrôle", "interro", "evaluation", "évaluation", "test"]
-                for i in range(7):
-                    day = today + timedelta(days=i)
-                    if day.weekday() >= 5: continue
-                    hws = self.client.homework(day, day)
-                    for hw in hws:
-                        desc_lower = hw.description.lower()
-                        if any(kw in desc_lower for kw in keywords):
-                            found = True
-                            msg += f"• *{JOURS_FR[day.weekday()]} {day.strftime('%d/%m')}* - {hw.subject.name} :\n  {hw.description[:100]}...\n"
-                self._telegram(msg if found else "✅ Aucun contrôle détecté.")
-
-            elif text == '/infos':
-                self._telegram("⏳ _Recherche des infos..._")
-                self._refresh_session()
-                infos = self.client.information_and_surveys()
-                msg = "*📢 Dernières informations*\n\n"
-                count = 0
-                for item in infos:
-                    if count >= 5: break
-                    msg += f"• *{item.title}* ({item.creation_date.strftime('%d/%m')})\n"
-                    count += 1
-                self._telegram(msg if count > 0 else "Aucune nouvelle information.")
-
-            elif text == '/fichiers':
-                self._telegram("⏳ _Recherche des fichiers récents..._")
-                self._refresh_session()
-                today = date.today()
-                lessons = self.client.lessons(today - timedelta(days=1), today)
-                found = False
-                for lesson in lessons:
-                    if hasattr(lesson, 'content') and lesson.content:
-                        for item in lesson.content:
-                            if getattr(item, 'type', 0) == 1:
-                                found = True
-                                self._telegram_document(item.data, item.name, caption=f"📄 {lesson.subject.name}")
-                if not found:
-                    self._telegram("Aucun nouveau fichier aujourd'hui.")
-
-            elif text in ['/messages', '💬 messages']:
-                self._telegram("⏳ _Recherche des messages..._")
-                self._refresh_session()
-                discussions = self.client.discussions()
-                msg = "*💬 Tes derniers messages*\n\n"
-                count = 0
-                for disc in discussions:
-                    for m in disc.messages:
-                        if count >= 5: break
-                        is_read = getattr(m, 'read', True)
-                        statut = "🟢" if not is_read else "⚪"
-                        msg += f"{statut} *{m.author}* ({m.date.strftime('%d/%m')}) :\n{disc.subject} - {m.content[:80]}...\n\n"
-                        count += 1
-                    if count >= 5: break
-                self._telegram(msg if count > 0 else "Aucun message.")
-                
-        except Exception as e:
-            log.error(f"Erreur commande {text} : {e}")
-            self._telegram(f"❌ *Erreur :*\n`{str(e)}`")
 
 # ---------------------------------------------------------------------------
 # LANCEMENT
@@ -798,8 +524,7 @@ def health():
 @app.route("/check")
 def manual_check():
     try:
-        bot.check_grades()
-        bot.check_homework_and_timetable_daily()
+        bot.update_cache()
         return jsonify(status="done"), 200
     except Exception as e:
         return jsonify(status="error", error=str(e)), 500
@@ -807,32 +532,20 @@ def manual_check():
 def scheduler_loop():
     try:
         bot.connect()
+        bot.update_cache() # Mise à jour initiale au démarrage
     except Exception as e:
         log.warning("Connexion initiale échouée : %s", e)
 
     scheduler = BackgroundScheduler(timezone="Europe/Paris")
 
     # --- CONFIGURATION DES HORAIRES (9h00, 12h00, 14h30, 19h30) ---
-    # On ajoute 1 à 7 minutes de décalage pour ne pas spammer Pronote avec 10 requêtes à la même seconde.
     heures = [(9, 0), (12, 0), (14, 30), (19, 30)]
-    
     for h, m in heures:
-        scheduler.add_job(bot.check_grades, CronTrigger(hour=h, minute=m))
-        scheduler.add_job(bot.check_informations, CronTrigger(hour=h, minute=m+1))
-        scheduler.add_job(bot.check_discussions, CronTrigger(hour=h, minute=m+2))
-        scheduler.add_job(bot.check_absences, CronTrigger(hour=h, minute=m+3))
-        scheduler.add_job(bot.check_punishments, CronTrigger(hour=h, minute=m+4))
-        scheduler.add_job(bot.check_skills, CronTrigger(hour=h, minute=m+5))
-        scheduler.add_job(bot.check_lesson_files, CronTrigger(hour=h, minute=m+6))
-        scheduler.add_job(bot.check_lesson_changes, CronTrigger(hour=h, minute=m+7))
-
-    # Planifications spécifiques
-    scheduler.add_job(bot.check_homework_and_timetable_daily, CronTrigger(hour=19, minute=38)) # Décalé après les autres
-    scheduler.add_job(bot.check_menus, CronTrigger(day_of_week='sun', hour=18, minute=0))
-    scheduler.add_job(bot.send_weekly_summary, CronTrigger(day_of_week='sun', hour=19, minute=45))
+        # Une seule tâche par horaire : elle se connecte, télécharge tout et met à jour le cache.
+        scheduler.add_job(bot.update_cache, CronTrigger(hour=h, minute=m))
 
     scheduler.start()
-    log.info("Planificateur démarré avec les horaires personnalisés.")
+    log.info("Planificateur démarré (Mise à jour du cache à 9h, 12h, 14h30 et 19h30).")
 
     threading.Thread(target=bot._poll_telegram, daemon=True).start()
 
